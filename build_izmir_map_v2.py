@@ -30,7 +30,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OVERTURE_DIR = os.path.join(BASE_DIR, "osm_cache", "overture")
 DEM_DIR = os.path.join(BASE_DIR, "osm_cache", "dem_tiles")
 OUT_DIR = BASE_DIR
-ARTIFACT_DIR = "/home/ahmetbey/.gemini/antigravity/brain/bf14e2aa-44c3-4391-99db-ef8d5ce423d1"
+ARTIFACT_DIR = os.environ.get("IZMIR_OUT_DIR", "")
 
 # Full Metro Izmir Viewport
 MASTER_BBOX = (26.860, 38.220, 27.340, 38.650)  # lon0, lat0, lon1, lat1
@@ -1270,7 +1270,7 @@ def render_map(data: GISWorldData, bbox, w, h, out_path, title, is_detail=False,
 
     final_img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
     final_img.save(out_path, optimize=True)
-    if os.path.isdir(ARTIFACT_DIR):
+    if ARTIFACT_DIR and os.path.isdir(ARTIFACT_DIR):
         shutil.copy2(out_path, os.path.join(ARTIFACT_DIR, os.path.basename(out_path)))
     print(f"  Saved {out_path} in {time.time() - t0:.1f}s", flush=True)
 

@@ -10,3 +10,7 @@ izmir_flight_sim
 __pycache__/
 *.pyc
 .venv/
+
+# Local headless renders
+renders/
+verif_*.png

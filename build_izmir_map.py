@@ -14,7 +14,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 CACHE_DIR = Path(__file__).resolve().parent / "osm_cache"
-ARTIFACT_DIR = Path("/home/ahmetbey/.gemini/antigravity/brain/bf14e2aa-44c3-4391-99db-ef8d5ce423d1")
+ARTIFACT_DIR = Path(os.environ.get("IZMIR_OUT_DIR", str(Path(__file__).resolve().parent / "renders")))
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Font yukleyici

@@ -395,7 +395,40 @@ def load_roads_and_rails():
         "living_street": (4, 2.9),
         "pedestrian": (4, 3.2),
         "service": (4, 2.4),
+        "track": (4, 2.6),
+        "unknown": (4, 3.0),
     }
+
+    world_clip_box = shapely.geometry.box(
+        WORLD_X0 + 12.0, WORLD_Z0 + 12.0, WORLD_X1 - 12.0, WORLD_Z1 - 12.0
+    )
+
+    def clip_metric_lines(m_pts, tol):
+        if len(m_pts) < 2:
+            return []
+        ln = shapely.LineString(m_pts)
+        b0, b1, b2, b3 = ln.bounds
+        if b2 < WORLD_X0 + 12.0 or b0 > WORLD_X1 - 12.0 or b3 < WORLD_Z0 + 12.0 or b1 > WORLD_Z1 - 12.0:
+            return []
+        if b0 < WORLD_X0 + 12.0 or b2 > WORLD_X1 - 12.0 or b1 < WORLD_Z0 + 12.0 or b3 > WORLD_Z1 - 12.0:
+            geom = ln.intersection(world_clip_box)
+        else:
+            geom = ln
+        if geom.is_empty:
+            return []
+        parts = [geom] if geom.geom_type == "LineString" else (
+            [p for p in geom.geoms if p.geom_type == "LineString"]
+            if hasattr(geom, "geoms") else []
+        )
+        out = []
+        for p in parts:
+            if p.length < 1.0:
+                continue
+            sp = p.simplify(tol, preserve_topology=False)
+            coords = list(sp.coords)
+            if len(coords) >= 2:
+                out.append(coords)
+        return out
 
     for i in range(n):
         st = d["subtype"][i]
@@ -417,12 +450,8 @@ def load_roads_and_rails():
                 if lvl < 0:
                     continue
                 m_pts = [(lon_to_x(x), lat_to_z(y)) for x, y in sub.coords]
-                if len(m_pts) < 2:
-                    continue
-                simp = shapely.LineString(m_pts).simplify(0.5, preserve_topology=False)
-                coords = list(simp.coords)
-                if len(coords) >= 2:
-                    is_br = 1 if ("is_bridge" in fset or lvl > 0) else 0
+                is_br = 1 if ("is_bridge" in fset or lvl > 0) else 0
+                for coords in clip_metric_lines(m_pts, 0.5):
                     rails.append((rtype, is_br, coords))
 
         elif st == "road":
@@ -432,56 +461,67 @@ def load_roads_and_rails():
             if ds != "OpenStreetMap" and cl == "unknown":
                 tt_roads_raw.append((g, spans))
             else:
-                if ds == "OpenStreetMap":
-                    osm_road_geoms.append(g)
                 if cl not in road_spec:
                     continue
+                if ds == "OpenStreetMap":
+                    osm_road_geoms.append(g)
                 tier, hw = road_spec[cl]
                 for sub, fset, lvl in spans:
-                    if fset & {"is_abandoned", "is_disused", "is_under_construction", "is_tunnel"}:
-                        continue
-                    if lvl < 0:
-                        continue
                     osm_spans_raw.append((tier, hw, fset, lvl, sub))
 
-    # Deduplicate TomTom unknown missing streets against OSM roads
+    # Deduplicate TomTom unknown missing streets against OSM roads via buffer overlap ratio
     osm_tree = STRtree(osm_road_geoms) if osm_road_geoms else None
+    osm_road_bufs = [og.buffer(0.000085) for og in osm_road_geoms] if osm_road_geoms else []
     tt_kept, tt_dropped = 0, 0
     roads = []  # (tier: int, is_bridge: int, level: int, hw_dm: int, pts: list[(x,z)])
 
     def emit_road(tier, hw, fset, lvl, sub_geom):
+        if fset & {"is_abandoned", "is_disused", "is_under_construction"}:
+            return
         m_pts = [(lon_to_x(x), lat_to_z(y)) for x, y in sub_geom.coords]
         if len(m_pts) < 2:
             return
-        simp = shapely.LineString(m_pts).simplify(0.6, preserve_topology=False)
-        coords = list(simp.coords)
-        if len(coords) < 2:
-            return
-        is_br = 1 if ("is_bridge" in fset or lvl > 0) else 0
+        if "is_tunnel" in fset:
+            seg_len = sum(
+                math.hypot(m_pts[k + 1][0] - m_pts[k][0], m_pts[k + 1][1] - m_pts[k][1])
+                for k in range(len(m_pts) - 1)
+            )
+            # Keep short (<85m) surface/overpass underpasses continuous; skip deep tunnels
+            if tier == 0 or seg_len >= 85.0:
+                return
+            is_br = 0
+            lvl_clamped = 0
+        elif lvl < 0:
+            # Open depressed surface underpass (not flagged as tunnel)
+            is_br = 0
+            lvl_clamped = 0
+        else:
+            is_br = 1 if ("is_bridge" in fset or lvl > 0) else 0
+            lvl_clamped = max(-5, min(5, int(lvl)))
         hw_dm = max(15, min(255, int(round(hw * 10.0))))
-        lvl_clamped = max(-5, min(5, int(lvl)))
-        roads.append((tier, is_br, lvl_clamped, hw_dm, coords))
+        for coords in clip_metric_lines(m_pts, 0.6):
+            roads.append((tier, is_br, lvl_clamped, hw_dm, coords))
 
     for tier, hw, fset, lvl, sub in osm_spans_raw:
         emit_road(tier, hw, fset, lvl, sub)
 
     for g, spans in tt_roads_raw:
+        g_len = g.length
+        if g_len <= 1e-8:
+            tt_dropped += 1
+            continue
         dup = False
         if osm_tree is not None:
-            near_idx = osm_tree.query(g.buffer(0.00012))
-            for ni in near_idx:
-                if g.distance(osm_road_geoms[ni]) < 0.00011:
+            near_idx = osm_tree.query(g.buffer(0.00010))
+            if len(near_idx) > 0:
+                near_buf = shapely.unary_union([osm_road_bufs[ni] for ni in near_idx])
+                if (g.intersection(near_buf).length / g_len) > 0.50:
                     dup = True
-                    break
         if dup:
             tt_dropped += 1
             continue
         tt_kept += 1
         for sub, fset, lvl in spans:
-            if fset & {"is_abandoned", "is_disused", "is_under_construction", "is_tunnel"}:
-                continue
-            if lvl < 0:
-                continue
             emit_road(4, 3.2, fset, lvl, sub)
 
     print(f"  Rails={len(rails)}, Roads={len(roads)} (TomTom kept={tt_kept}, dropped={tt_dropped}) in {time.time() - t0:.2f}s", flush=True)

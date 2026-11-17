@@ -1,19 +1,22 @@
 // =====================================================================================
 //  IZMIR 3D UCUS VE SEHIR SIMULATORU  (izmir_flight_sim.cpp)
 //  ---------------------------------------------------------------------------------
-//  Tek dosyalik, harici veri dosyasi OKUMAYAN, tamamen matematiksel olarak sentezlenen
-//  35 km x 45 km Izmir dunyasi + 6-DOF 240 Hz ucus fizigi.
+//  Overture+OSM+DEM (izmir_osm_world.bin) destekli, yedek sentetik uretimli
+//  35 km x 45 km Izmir dunyasi + 6-DOF 240 Hz ucus + silah/patlama/yangin fizigi.
 //
 //  Derleme:
-//    g++ -O3 -std=c++17 -Wall -Wextra izmir_flight_sim.cpp -o izmir_flight_sim -lX11 -lGL -lGLU -lm
+//    g++ -O3 -std=c++17 -Wall -Wextra izmir_flight_sim.cpp -o izmir_flight_sim -lEGL -lX11 -lGL -lGLU -lm -lpthread
 //
 //  Projeksiyon (WGS84 yerel metrik, referans: Konak Saat Kulesi):
 //    x = (lon - REF_LON) * 87215.0   [+X Dogu, -X Bati]
 //    z = -(lat - REF_LAT) * 111132.0 [-Z Kuzey, +Z Guney], +Y irtifa
 //
 //  Komut satiri:
-//    ./izmir_flight_sim              -> simulator
-//    ./izmir_flight_sim --test-gen   -> X11 olmadan dunya uretimi + dogrulama istatistikleri
+//    ./izmir_flight_sim                   -> simulator
+//    ./izmir_flight_sim --test-gen        -> X11 olmadan dunya uretimi + 8 dogrulama testi
+//    ./izmir_flight_sim --inspect-city    -> 24 noktali otonom sehir turu gorselleri
+//    ./izmir_flight_sim --inspect-night   -> gece/gunbatimi/gunduz performans cekimleri
+//    ./izmir_flight_sim --inspect-combat  -> silah, bomba patlamasi ve 30s bina yangini cekimi
 // =====================================================================================
 
 #include <X11/Xlib.h>
@@ -29,6 +32,7 @@
 #include <linux/joystick.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -658,7 +662,7 @@ static void drawTextWorld(const Vec3& center, float yawRad, float pixelSize, con
     glEnable(GL_LIGHTING);
 }
 
-// 11 adet Doku (10x 512x512 Prosedurel HD Doku + 1x 2048x2048 Gercek Overture GIS Arazi Ortusu)
+// 12 adet Doku (11x 512x512 Prosedurel HD Doku + 1x 2048x2048 Gercek Overture GIS Arazi Ortusu)
 enum {
     TEX_GRASS = 0,
     TEX_ROCK,
@@ -670,10 +674,13 @@ enum {
     TEX_INDUSTRIAL,
     TEX_ROOF_TILE,
     TEX_BALLAST,
+    TEX_NIGHT_WINDOWS,
     TEX_GIS_MAP,
-    NUM_TEXTURES = 11
+    NUM_TEXTURES = 12
 };
 static GLuint g_tex[NUM_TEXTURES] = {0};
+static GLuint g_texParticle = 0;
+static bool   g_glReady = false;
 
 static void buildProceduralTextures() {
     glGenTextures(NUM_TEXTURES, g_tex);
@@ -699,114 +706,154 @@ static void buildProceduralTextures() {
                         float patch = 0.5f + 0.5f * n1;
                         float micro = 0.5f + 0.5f * n2;
                         float soilMix = clampf(n1 * 0.65f + n2 * 0.35f, 0.0f, 1.0f);
-                        // Kizilcam derin zumrut (36, 76, 28) -> Tarla canli maki yesili (72, 132, 44) -> Kuru toprak (110, 98, 64)
-                        float grnR = lerpf(36.0f, 72.0f, patch);
-                        float grnG = lerpf(76.0f, 132.0f, patch);
-                        float grnB = lerpf(28.0f, 44.0f, patch);
-                        r = lerpf(grnR, 110.0f, soilMix * 0.30f) + (micro - 0.5f) * 22.0f;
-                        g = lerpf(grnG, 98.0f,  soilMix * 0.30f) + (micro - 0.5f) * 26.0f;
-                        b = lerpf(grnB, 64.0f,  soilMix * 0.30f) + (micro - 0.5f) * 18.0f;
+                        float grnR = lerpf(34.0f, 74.0f, patch);
+                        float grnG = lerpf(78.0f, 136.0f, patch);
+                        float grnB = lerpf(26.0f, 46.0f, patch);
+                        r = lerpf(grnR, 114.0f, soilMix * 0.32f) + (micro - 0.5f) * 24.0f;
+                        g = lerpf(grnG, 102.0f, soilMix * 0.32f) + (micro - 0.5f) * 28.0f;
+                        b = lerpf(grnB, 66.0f,  soilMix * 0.32f) + (micro - 0.5f) * 18.0f;
                     } else if (tid == TEX_ROCK) {
                         // Yamanlar / Catalkaya kalker ve bazalt kaya dokusu (sedimanter tabakali)
                         float rg = ridged2(u * 10.0f, v * 10.0f, 5);
                         float cr = std::sin((u * 14.0f + n1 * 2.2f) * PI_F * 2.0f) * 0.5f + 0.5f;
                         float val = clampf(0.42f * rg + 0.35f * (0.5f + 0.5f * n2) + 0.23f * cr, 0.0f, 1.0f);
-                        r = lerpf(88.0f, 168.0f, val);
-                        g = lerpf(86.0f, 164.0f, val);
-                        b = lerpf(82.0f, 158.0f, val);
+                        r = lerpf(86.0f, 172.0f, val);
+                        g = lerpf(84.0f, 166.0f, val);
+                        b = lerpf(78.0f, 158.0f, val);
                     } else if (tid == TEX_WATER) {
-                        // Ege Korfezi dalga ve kostik su dokusu (turkuaz-lacivert gradyan ve kopukler)
-                        float w1 = std::sin((u * 14.0f + n1 * 1.8f) * 2.0f * PI_F);
-                        float w2 = std::cos((v * 18.0f + n2 * 2.0f) * 2.0f * PI_F);
-                        float foam = clampf((n2 - 0.44f) * 4.2f, 0.0f, 1.0f);
-                        float c = clampf(0.5f + 0.28f * w1 + 0.22f * w2, 0.0f, 1.0f);
-                        r = lerpf(12.0f, 52.0f, c) + foam * 165.0f;
-                        g = lerpf(55.0f, 138.0f, c) + foam * 185.0f;
-                        b = lerpf(105.0f, 198.0f, c) + foam * 198.0f;
+                        // Ege Korfezi ince dalgacikli kostik su dokusu
+                        float w1 = std::sin((u * 16.0f + n1 * 2.1f) * 2.0f * PI_F);
+                        float w2 = std::cos((v * 22.0f - u * 6.0f + n2 * 1.9f) * 2.0f * PI_F);
+                        float ripple = std::sin((u * 40.0f + v * 36.0f + n2 * 3.0f) * 2.0f * PI_F) * 0.5f + 0.5f;
+                        float foam = clampf((n2 - 0.46f) * 4.5f, 0.0f, 1.0f);
+                        float c = clampf(0.48f + 0.24f * w1 + 0.18f * w2 + 0.10f * ripple, 0.0f, 1.0f);
+                        r = lerpf(16.0f, 56.0f, c) + foam * 145.0f;
+                        g = lerpf(62.0f, 146.0f, c) + foam * 168.0f;
+                        b = lerpf(118.0f, 206.0f, c) + foam * 182.0f;
                     } else if (tid == TEX_ASPHALT) {
-                        // Pist, otoyol ve ara sokak saf asfalt agregasi (koyu antrasit bitum)
-                        float grain = (hash01(x, y) - 0.5f) * 18.0f + n2 * 10.0f;
-                        float base = 44.0f + grain;
-                        r = base; g = base + 1.0f; b = base + 3.0f;
+                        // Yuksek kontrastli ince agrega asfalt ve lastik izi dokusu
+                        float grain = (hash01(x, y) - 0.5f) * 20.0f + n2 * 12.0f;
+                        float wear = std::sin(u * 2.0f * PI_F) * 4.0f;
+                        float base = 42.0f + grain + wear;
+                        r = base; g = base + 1.5f; b = base + 4.0f;
                     } else if (tid == TEX_CONCRETE) {
-                        // Kaldirim karo mozaik, kordon graniti ve apron derzleri
+                        // Akdeniz granit / kordon tas kaldirim derzleri
                         int gx = x % 32, gy = y % 32;
-                        float joint = (gx == 0 || gy == 0) ? -32.0f : 0.0f;
-                        float base = 196.0f + n2 * 16.0f + joint;
-                        r = base + 2.0f; g = base; b = base - 3.0f;
+                        float joint = (gx <= 1 || gy <= 1) ? -28.0f : 0.0f;
+                        float tileVar = (hash01(x / 32, y / 32) - 0.5f) * 12.0f;
+                        float base = 196.0f + n2 * 14.0f + joint + tileVar;
+                        r = base + 3.0f; g = base + 1.0f; b = base - 3.0f;
                     } else if (tid == TEX_APT_FACADE) {
-                        // Modern Akdeniz apartman cephesi: genis balkonlar, cam korkuluk, pencereler ve dukkan vitrinleri
+                        // Modern Akdeniz apartman cephesi: kat silmeleri, derin balkon golgeleri, reflekte pencereler
                         int wx = x % 64, wy = y % 64;
                         int floorId = y / 64, colId = x / 64;
-                        bool isSlabLedge = (wy < 4);
-                        bool isBalconyRail = (wy >= 42 && wy <= 56 && wx >= 4 && wx <= 60);
-                        bool isBalconyRecess = (wy >= 10 && wy < 42 && wx >= 6 && wx <= 58);
-                        bool isWindow = (wy >= 14 && wy <= 42 && wx >= 12 && wx <= 52);
-                        bool isFrame = isWindow && (wx < 15 || wx > 49 || wy < 16 || wy > 40 || (wx >= 31 && wx <= 33));
-                        bool isAcUnit = (wy >= 44 && wy <= 54 && wx >= 8 && wx <= 20 && ((floorId + colId) % 3 == 0));
+                        bool isSlabLedge = (wy < 4 || wy >= 61);
+                        bool isColumn = (wx < 5 || wx >= 59);
+                        bool isBalconyRail = (wy >= 43 && wy <= 56 && wx >= 6 && wx <= 58);
+                        bool isBalconyShadow = (wy >= 7 && wy < 14 && wx >= 7 && wx <= 57);
+                        bool isWindow = (wy >= 13 && wy <= 42 && wx >= 11 && wx <= 53);
+                        bool isFrame = isWindow && (wx < 14 || wx > 50 || wy < 16 || wy > 39 || (wx >= 31 && wx <= 33));
+                        bool isAcUnit = (wy >= 45 && wy <= 54 && wx >= 9 && wx <= 20 && ((floorId + colId) % 3 == 0));
 
-                        float plaster = 234.0f + n2 * 10.0f - (isSlabLedge ? 42.0f : 0.0f) - (isBalconyRecess ? 26.0f : 0.0f);
-                        r = plaster; g = plaster - 4.0f; b = plaster - 10.0f;
+                        float plaster = 232.0f + n2 * 9.0f - (isSlabLedge ? 36.0f : 0.0f)
+                                      - (isColumn ? 10.0f : 0.0f) - (isBalconyShadow ? 42.0f : 0.0f);
+                        r = plaster; g = plaster - 4.0f; b = plaster - 11.0f;
                         if (isWindow) {
                             if (isFrame) {
-                                r = 245; g = 245; b = 248; // Beyaz alüminyum pencere kasasi
+                                r = 242; g = 244; b = 248;
                             } else {
-                                float refl = 0.5f + 0.5f * std::sin((float)wy * 0.12f);
-                                r = lerpf(36.0f, 85.0f, refl);
-                                g = lerpf(68.0f, 142.0f, refl);
-                                b = lerpf(115.0f, 210.0f, refl);
+                                float refl = 0.5f + 0.5f * std::sin((float)wy * 0.16f + (float)wx * 0.06f);
+                                float roomTint = hash01(colId * 13 + (wx > 32), floorId * 29);
+                                r = lerpf(28.0f, 76.0f, refl) + roomTint * 16.0f;
+                                g = lerpf(56.0f, 128.0f, refl) + roomTint * 18.0f;
+                                b = lerpf(98.0f, 198.0f, refl) + roomTint * 20.0f;
                             }
                         }
                         if (isBalconyRail) {
-                            r = 160; g = 192; b = 210; // Cam/demir korkuluk
+                            if (wy <= 45) { r = 195; g = 205; b = 214; }
+                            else { r = 135; g = 175; b = 198; }
                         }
                         if (isAcUnit) {
-                            r = 240; g = 238; b = 235; // Beyaz klima dis unites
+                            r = 236; g = 234; b = 230;
                         }
                     } else if (tid == TEX_GLASS_TOWER) {
-                        // Bayrakli / Mavisehir cam giydirme rezidans & gokdelen cephesi
+                        // Bayrakli / Mavisehir cam giydirme perde duvar: gokyuzu yansimasi + koyu aluminyum karkas
                         int wx = x % 32, wy = y % 32;
-                        bool mullion = (wx < 3 || wy < 3);
+                        bool mullion = (wx < 2 || wy < 2);
+                        bool spandrel = (wy >= 2 && wy < 7);
                         int cid = x / 32, fid = y / 32;
                         if (mullion) {
-                            r = 180; g = 192; b = 205;
+                            r = 42; g = 52; b = 64;
+                        } else if (spandrel) {
+                            r = 95; g = 122; b = 148;
                         } else {
                             float h = hash01(cid * 19, fid * 37);
-                            float skyRef = 0.5f + 0.5f * std::sin(v * 6.0f * PI_F + n1);
-                            if (h > 0.62f) {
-                                r = 218; g = 238; b = 254;
+                            float skyStreak = 0.5f + 0.5f * std::sin((u * 4.0f + v * 2.5f) * PI_F + n1 * 1.6f);
+                            if (h > 0.68f) {
+                                r = lerpf(168.0f, 226.0f, skyStreak);
+                                g = lerpf(208.0f, 242.0f, skyStreak);
+                                b = lerpf(236.0f, 255.0f, skyStreak);
                             } else {
-                                r = lerpf(28.0f, 82.0f, skyRef);
-                                g = lerpf(78.0f, 156.0f, skyRef);
-                                b = lerpf(135.0f, 224.0f, skyRef);
+                                r = lerpf(26.0f, 78.0f, skyStreak);
+                                g = lerpf(74.0f, 152.0f, skyStreak);
+                                b = lerpf(130.0f, 222.0f, skyStreak);
                             }
                         }
                     } else if (tid == TEX_INDUSTRIAL) {
-                        // Cigli AOSB / Ata Sanayi oluklu sac fabrika cephesi
-                        float corrug = std::sin(u * 128.0f * 2.0f * PI_F) * 18.0f;
-                        bool skylight = ((y % 128) >= 24 && (y % 128) <= 44 && (x % 64) >= 8 && (x % 64) <= 56);
+                        // Cigli AOSB / Ata Sanayi oluklu sac + cati bandi aydinlatma
+                        float corrug = std::sin(u * 128.0f * 2.0f * PI_F) * 16.0f;
+                        bool skylight = ((y % 128) >= 22 && (y % 128) <= 44 && (x % 64) >= 8 && (x % 64) <= 56);
                         if (skylight) {
-                            r = 195; g = 222; b = 245;
+                            r = 185; g = 216; b = 242;
                         } else {
-                            r = 138.0f + corrug + n2 * 10.0f;
-                            g = 154.0f + corrug + n2 * 10.0f;
-                            b = 176.0f + corrug + n2 * 10.0f;
+                            r = 136.0f + corrug + n2 * 10.0f;
+                            g = 152.0f + corrug + n2 * 10.0f;
+                            b = 174.0f + corrug + n2 * 10.0f;
                         }
                     } else if (tid == TEX_ROOF_TILE) {
-                        // Ege Marsilya ve Alaturka kiremit cati dokusu (sicak terracotta)
-                        float waveX = std::sin(u * 64.0f * 2.0f * PI_F) * 22.0f;
-                        float rowStep = ((y % 16) < 3) ? -38.0f : 0.0f;
-                        r = 188.0f + waveX + rowStep + n1 * 14.0f;
-                        g = 72.0f + waveX * 0.45f + rowStep * 0.45f + n1 * 8.0f;
-                        b = 44.0f + waveX * 0.30f + rowStep * 0.30f + n1 * 6.0f;
+                        // Ege Marsilya / Alaturka kiremit cati dokusu (derin oluk golgeli sicak terracotta)
+                        float waveX = std::sin(u * 64.0f * 2.0f * PI_F) * 26.0f;
+                        float rowStep = ((y % 16) < 3) ? -44.0f : (((y % 16) >= 13) ? 12.0f : 0.0f);
+                        float tileVar = (hash01(x / 8, y / 16) - 0.5f) * 18.0f;
+                        r = 192.0f + waveX + rowStep + tileVar + n1 * 12.0f;
+                        g = 76.0f  + waveX * 0.45f + rowStep * 0.45f + tileVar * 0.5f + n1 * 8.0f;
+                        b = 44.0f  + waveX * 0.30f + rowStep * 0.30f + tileVar * 0.3f + n1 * 6.0f;
                     } else if (tid == TEX_BALLAST) {
-                        // IZBAN kirma tas balast + travers
+                        // IZBAN kirma tas balast + beton travers
                         float stone = (hash01(x / 2, y / 2) - 0.5f) * 55.0f + n2 * 28.0f;
                         bool sleeper = ((y % 32) >= 8 && (y % 32) <= 20 && x >= 64 && x <= 448);
                         if (sleeper) {
-                            r = 112.0f + n2 * 14.0f; g = 108.0f + n2 * 14.0f; b = 104.0f + n2 * 14.0f;
+                            r = 114.0f + n2 * 14.0f; g = 110.0f + n2 * 14.0f; b = 106.0f + n2 * 14.0f;
                         } else {
                             r = 118.0f + stone; g = 114.0f + stone; b = 110.0f + stone;
+                        }
+                    } else if (tid == TEX_NIGHT_WINDOWS) {
+                        // Gece parlayan pencere katmani (sadece pencere icleri isikli, duvarlar saf 0,0,0 -> GL_ONE toplamsal)
+                        int wx = x % 64, wy = y % 64;
+                        int floorId = y / 64, colId = x / 64;
+                        bool leftPane = (wx >= 11 && wx <= 29 && wy >= 14 && wy <= 43);
+                        bool rightPane = (wx >= 34 && wx <= 52 && wy >= 14 && wy <= 43);
+                        r = 0.0f; g = 0.0f; b = 0.0f;
+                        if (leftPane || rightPane) {
+                            int paneIdx = colId * 2 + (rightPane ? 1 : 0);
+                            float h = hash01(paneIdx * 31 + 7, floorId * 53 + 11);
+                            if (h > 0.48f) {
+                                float tintH = hash01(paneIdx * 17 + 3, floorId * 41 + 9);
+                                float shade = 0.72f + 0.28f * (1.0f - std::fabs((wy - 28.5f) / 14.0f));
+                                if (tintH < 0.45f) {
+                                    // Sicak tungsten apartman isigi
+                                    r = 255.0f * shade; g = 198.0f * shade; b = 104.0f * shade;
+                                } else if (tintH < 0.75f) {
+                                    // Altin / yumusak beyaz ev isigi
+                                    r = 255.0f * shade; g = 228.0f * shade; b = 165.0f * shade;
+                                } else if (tintH < 0.90f) {
+                                    // Soguk beyaz / ofis LED
+                                    r = 188.0f * shade; g = 226.0f * shade; b = 255.0f * shade;
+                                } else {
+                                    // Hafif camgobegi TV/ofis pariltisi
+                                    r = 148.0f * shade; g = 198.0f * shade; b = 255.0f * shade;
+                                }
+                            }
                         }
                     }
                     int idx = (y * W + x) * 3;
@@ -825,7 +872,33 @@ static void buildProceduralTextures() {
         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, targetAniso);
         gluBuild2DMipmaps(GL_TEXTURE_2D, GL_RGB, W, H, GL_RGB, GL_UNSIGNED_BYTE, rgb.data());
     }
+
+    // Yumusak duman / alev / patlama partikul sprite dokusu (64x64 RGBA)
+    glGenTextures(1, &g_texParticle);
+    const int PW = 64, PH = 64;
+    std::vector<unsigned char> rgba(PW * PH * 4);
+    for (int y = 0; y < PH; y++) {
+        float dy = ((float)y + 0.5f) / (float)PH * 2.0f - 1.0f;
+        for (int x = 0; x < PW; x++) {
+            float dx = ((float)x + 0.5f) / (float)PW * 2.0f - 1.0f;
+            float r2 = dx * dx + dy * dy;
+            float a = (r2 < 1.0f) ? std::pow(1.0f - r2, 1.85f) : 0.0f;
+            int idx = (y * PW + x) * 4;
+            rgba[idx + 0] = 255;
+            rgba[idx + 1] = 255;
+            rgba[idx + 2] = 255;
+            rgba[idx + 3] = (unsigned char)clampf(a * 255.0f, 0.0f, 255.0f);
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D, g_texParticle);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gluBuild2DMipmaps(GL_TEXTURE_2D, GL_RGBA, PW, PH, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+
     glBindTexture(GL_TEXTURE_2D, 0);
+    g_glReady = true;
 }
 
 // =====================================================================================
@@ -1075,6 +1148,35 @@ static std::vector<uint8_t> g_gisGrid(MASK_N * MASK_N, LC_SHRUB);
 static bool g_hasGisGrid = false;
 static std::vector<Vec2> g_realTrees;
 
+static inline float terrainRenderElevCell(const WorldMaskCell& mc) {
+    if (mc.signedSeaDist >= 0.0f) return std::max(0.45f, mc.elev);
+    if (mc.signedSeaDist > -28.0f) {
+        return lerpf(std::max(0.45f, mc.elev), -0.05f, -mc.signedSeaDist / 28.0f);
+    }
+    float t = clampf((-mc.signedSeaDist - 28.0f) / 36.0f, 0.0f, 1.0f);
+    return lerpf(-0.05f, -3.5f, t);
+}
+
+static float sampleRenderedTerrainMaxElev(float wx, float wz) {
+    float bilinear = sampleTerrainElev(wx, wz);
+    if (!g_hasGisGrid) return bilinear;
+    float gx, gz;
+    worldToGridF(wx, wz, gx, gz);
+    const int step = 2;
+    int ix0 = clampi((((int)std::floor(gx)) & ~1), 0, MASK_N - 4);
+    int iz0 = clampi((((int)std::floor(gz)) & ~1), 0, MASK_N - 4);
+    float fx = clampf((gx - (float)ix0) * 0.5f, 0.0f, 1.0f);
+    float fz = clampf((gz - (float)iz0) * 0.5f, 0.0f, 1.0f);
+    float h00 = terrainRenderElevCell(maskCellAt(ix0,        iz0));
+    float h10 = terrainRenderElevCell(maskCellAt(ix0 + step, iz0));
+    float h01 = terrainRenderElevCell(maskCellAt(ix0,        iz0 + step));
+    float h11 = terrainRenderElevCell(maskCellAt(ix0 + step, iz0 + step));
+    float triElev = (fx + fz <= 1.0f)
+        ? (h00 + fx * (h10 - h00) + fz * (h01 - h00))
+        : (h11 + (1.0f - fx) * (h01 - h11) + (1.0f - fz) * (h10 - h11));
+    return std::max(bilinear, triElev);
+}
+
 struct V2RailSeg {
     uint8_t rtype;     // 0=izban(standard_gauge), 1=tram, 2=metro(surface)
     uint8_t isBridge;
@@ -1095,8 +1197,10 @@ struct V2MajorRoadPoly {
     int8_t level;
     float halfW;
     std::vector<Vec2> pts;
+    std::vector<float> ys;
 };
 static std::vector<V2MajorRoadPoly> g_v2MajorRoads;
+static std::vector<RoadSpline> g_v2DriveRoutes;
 static bool g_hasV2Roads = false;
 
 struct OsmSideStreetSeg { Vec2 a, b; };
@@ -1124,10 +1228,47 @@ static inline uint8_t sampleGisClass(float wx, float wz) {
     return g_gisGrid[iz * MASK_N + ix];
 }
 
+static std::vector<Vec2> subdividePolylinePreserveCorners(const std::vector<Vec2>& pts, float maxStepM) {
+    std::vector<Vec2> out;
+    if (pts.size() < 2) return pts;
+    out.push_back(pts[0]);
+    for (size_t k = 0; k + 1 < pts.size(); k++) {
+        Vec2 a = pts[k], b = pts[k + 1];
+        float d = len2(b - a);
+        if (d < 0.25f) continue;
+        int nSub = std::max(1, (int)std::ceil(d / maxStepM));
+        for (int s = 1; s <= nSub; s++) {
+            float t = (float)s / (float)nSub;
+            out.push_back(Vec2(lerpf(a.x, b.x, t), lerpf(a.z, b.z, t)));
+        }
+    }
+    return out;
+}
+
+static bool isOnRunwayStrip(Vec2 p) {
+    Vec2 ltbj = geoPt(LTBJ_LAT, LTBJ_LON);
+    Vec2 d1 = headingDir(LTBJ_HDG);
+    Vec2 r1(-d1.z, d1.x);
+    for (int s = -1; s <= 1; s += 2) {
+        Vec2 rc = ltbj + r1 * ((float)s * LTBJ_SEP * 0.5f);
+        Vec2 rel = p - rc;
+        if (std::fabs(dot2(rel, d1)) < LTBJ_LEN * 0.52f && std::fabs(dot2(rel, r1)) < 42.0f) return true;
+    }
+    Vec2 ltbl = geoPt(LTBL_LAT, LTBL_LON);
+    Vec2 d2 = headingDir(LTBL_HDG);
+    Vec2 r2(-d2.z, d2.x);
+    Vec2 rel2 = p - ltbl;
+    if (std::fabs(dot2(rel2, d2)) < LTBL_LEN * 0.52f && std::fabs(dot2(rel2, r2)) < 42.0f) return true;
+    return false;
+}
+
 static void pushRoadSegToV2(uint8_t tier, uint8_t isBridge, int8_t level, float halfW, const std::vector<Vec2>& pts) {
     if (pts.size() < 2) return;
     if (tier <= 2 || isBridge) {
-        g_v2MajorRoads.push_back({tier, isBridge, level, halfW, pts});
+        std::vector<Vec2> subPts = subdividePolylinePreserveCorners(pts, 16.0f);
+        if (subPts.size() >= 2) {
+            g_v2MajorRoads.push_back({tier, isBridge, level, halfW, std::move(subPts), {}});
+        }
         return;
     }
     for (size_t k = 0; k + 1 < pts.size(); k++) {
@@ -1135,16 +1276,16 @@ static void pushRoadSegToV2(uint8_t tier, uint8_t isBridge, int8_t level, float 
         float dx = p1.x - p0.x, dz = p1.z - p0.z;
         float d = std::sqrt(dx * dx + dz * dz);
         if (d < 0.5f) continue;
-        int nSub = std::max(1, (int)std::ceil(d / 28.0f));
+        int nSub = std::max(1, (int)std::ceil(d / 14.0f));
         for (int s = 0; s < nSub; s++) {
             float t0 = (float)s / (float)nSub;
             float t1 = (float)(s + 1) / (float)nSub;
             Vec2 a(p0.x + dx * t0, p0.z + dz * t0);
             Vec2 b(p0.x + dx * t1, p0.z + dz * t1);
-            float mx = 0.5f * (a.x + b.x);
-            float mz = 0.5f * (a.z + b.z);
-            int cx = clampi((int)((mx - WORLD_X0) / OSM_CHUNK_SZ), 0, OSM_CK_NX - 1);
-            int cz = clampi((int)((mz - WORLD_Z0) / OSM_CHUNK_SZ), 0, OSM_CK_NZ - 1);
+            Vec2 mid(0.5f * (a.x + b.x), 0.5f * (a.z + b.z));
+            if (tier >= 4 && (isOnRunwayStrip(a) || isOnRunwayStrip(b) || isOnRunwayStrip(mid))) continue;
+            int cx = clampi((int)((mid.x - WORLD_X0) / OSM_CHUNK_SZ), 0, OSM_CK_NX - 1);
+            int cz = clampi((int)((mid.z - WORLD_Z0) / OSM_CHUNK_SZ), 0, OSM_CK_NZ - 1);
             g_chunkV2Roads[cz * OSM_CK_NX + cx].push_back({tier, isBridge, level, halfW, a, b});
         }
     }
@@ -1231,12 +1372,16 @@ static bool loadOsmWorldBin(const char* path) {
             rs.isBridge = isBr;
             rs.pts.reserve(np);
             for (uint16_t k = 0; k < np; k++) rs.pts.emplace_back(rbuf[2 * k], rbuf[2 * k + 1]);
-            if (rs.pts.size() >= 2) g_v2Rails.push_back(std::move(rs));
+            if (rs.pts.size() >= 2) {
+                rs.pts = subdividePolylinePreserveCorners(rs.pts, 16.0f);
+                g_v2Rails.push_back(std::move(rs));
+            }
         }
 
         uint32_t nRoads = 0;
         std::fread(&nRoads, 4, 1, f);
         g_v2MajorRoads.clear();
+        g_v2DriveRoutes.clear();
         for (auto& ck : g_chunkV2Roads) ck.clear();
         for (uint32_t i = 0; i < nRoads; i++) {
             uint8_t tier = 4, isBr = 0, hwDm = 25;
@@ -2125,6 +2270,44 @@ static void buildGeographyAndWorldMask() {
         g_stationPos[s] = g_izbanSpline[bestI];
         g_stationTang[s] = g_izbanTangents[bestI];
     }
+
+    // V2 kiyi yollarindaki raster kenar tasmasi ile aciktaki iskele/mendirek patikalarini temizle
+    if (g_hasV2Roads) {
+        for (auto& rp : g_v2MajorRoads) {
+            if (rp.isBridge) continue;
+            for (auto& p : rp.pts) {
+                float sd = sampleSignedSeaDist(p.x, p.z);
+                if (sd < 2.0f && sd > -45.0f) {
+                    pushInlandFromSea(p.x, p.z, 2.0f);
+                }
+            }
+        }
+        for (auto& ckRoads : g_chunkV2Roads) {
+            ckRoads.erase(
+                std::remove_if(ckRoads.begin(), ckRoads.end(), [&](V2RoadSeg& seg) {
+                    if (seg.a.x < WORLD_X0 + 8.0f || seg.a.x > WORLD_X1 - 8.0f ||
+                        seg.a.z < WORLD_Z0 + 8.0f || seg.a.z > WORLD_Z1 - 8.0f ||
+                        seg.b.x < WORLD_X0 + 8.0f || seg.b.x > WORLD_X1 - 8.0f ||
+                        seg.b.z < WORLD_Z0 + 8.0f || seg.b.z > WORLD_Z1 - 8.0f) {
+                        return true;
+                    }
+                    if (seg.isBridge || seg.tier < 4) return false;
+                    Vec2 mid = (seg.a + seg.b) * 0.5f;
+                    return sampleSignedSeaDist(mid.x, mid.z) < -6.0f &&
+                           (sampleSignedSeaDist(seg.a.x, seg.a.z) < -6.0f ||
+                            sampleSignedSeaDist(seg.b.x, seg.b.z) < -6.0f);
+                }),
+                ckRoads.end()
+            );
+            for (auto& seg : ckRoads) {
+                if (seg.isBridge) continue;
+                float sdA = sampleSignedSeaDist(seg.a.x, seg.a.z);
+                if (sdA < 1.5f && sdA > -40.0f) pushInlandFromSea(seg.a.x, seg.a.z, 1.5f);
+                float sdB = sampleSignedSeaDist(seg.b.x, seg.b.z);
+                if (sdB < 1.5f && sdB > -40.0f) pushInlandFromSea(seg.b.x, seg.b.z, 1.5f);
+            }
+        }
+    }
 }
 
 // 7 Gercek IZDENIZ Vapur Iskelesi tanimlari ve deniz yaklasma koordinatlari
@@ -2139,28 +2322,46 @@ static const PierDef PIERS[NUM_PIERS] = {
     {"Göztepe İskele", 38.3985, 27.0960},
     {"Üçkuyular İskele", 38.4050, 27.0706}
 };
+static Vec2 g_pierShorePos[NUM_PIERS];
 static Vec2 g_pierSeaPos[NUM_PIERS];
 
 static void computePierSeaPositions() {
     int n = (int)g_coastSpline.size();
     for (int p = 0; p < NUM_PIERS; p++) {
         Vec2 target = geoPt(PIERS[p].lat, PIERS[p].lon);
+        g_pierShorePos[p] = target;
         if (g_hasGisGrid) {
-            Vec2 pos = target;
-            bool ok = false;
+            Vec2 shorePos = target;
             for (int it = 0; it < 36; it++) {
-                float sd = sampleSignedSeaDist(pos.x, pos.z);
-                if (sd <= -110.0f) { ok = true; break; }
-                float gx = sampleSignedSeaDist(pos.x + 18.0f, pos.z) - sampleSignedSeaDist(pos.x - 18.0f, pos.z);
-                float gz = sampleSignedSeaDist(pos.x, pos.z + 18.0f) - sampleSignedSeaDist(pos.x, pos.z - 18.0f);
+                float sd = sampleSignedSeaDist(shorePos.x, shorePos.z);
+                if (sd >= 24.0f && sd <= 34.0f) break;
+                float gx = sampleSignedSeaDist(shorePos.x + 16.0f, shorePos.z) - sampleSignedSeaDist(shorePos.x - 16.0f, shorePos.z);
+                float gz = sampleSignedSeaDist(shorePos.x, shorePos.z + 16.0f) - sampleSignedSeaDist(shorePos.x, shorePos.z - 16.0f);
                 float gm = std::sqrt(gx * gx + gz * gz);
                 if (gm < 1e-4f) break;
-                float step = clampf(sd + 115.0f, 8.0f, 70.0f);
-                pos.x -= (gx / gm) * step;
-                pos.z -= (gz / gm) * step;
+                float delta = clampf(28.0f - sd, -65.0f, 65.0f);
+                shorePos.x += (gx / gm) * delta;
+                shorePos.z += (gz / gm) * delta;
+            }
+            g_pierShorePos[p] = shorePos;
+
+            Vec2 seaPos = shorePos;
+            bool ok = false;
+            for (int it = 0; it < 36; it++) {
+                float sd = sampleSignedSeaDist(seaPos.x, seaPos.z);
+                if (sd <= -140.0f) { ok = true; break; }
+                float gx = sampleSignedSeaDist(seaPos.x + 18.0f, seaPos.z) - sampleSignedSeaDist(seaPos.x - 18.0f, seaPos.z);
+                float gz = sampleSignedSeaDist(seaPos.x, seaPos.z + 18.0f) - sampleSignedSeaDist(seaPos.x, seaPos.z - 18.0f);
+                float gm = std::sqrt(gx * gx + gz * gz);
+                if (gm < 1e-4f) break;
+                float step = clampf(sd + 145.0f, 10.0f, 75.0f);
+                seaPos.x -= (gx / gm) * step;
+                seaPos.z -= (gz / gm) * step;
             }
             if (ok) {
-                g_pierSeaPos[p] = pos;
+                Vec2 seaDir = norm2(seaPos - shorePos);
+                Vec2 dockPos = shorePos + seaDir * 135.0f;
+                g_pierSeaPos[p] = (sampleSignedSeaDist(dockPos.x, dockPos.z) <= -45.0f) ? dockPos : seaPos;
                 continue;
             }
         }
@@ -2231,7 +2432,11 @@ struct CityChunk {
     GLuint dlApt = 0;
     GLuint dlGlass = 0;
     GLuint dlInd = 0;
-    GLuint dlRoofAndTrees = 0;
+    GLuint dlRoof = 0;
+    GLuint dlTileRoof = 0;
+    GLuint dlNearDetails = 0;
+    GLuint dlMidTrees = 0;
+    GLuint dlSkylineLod = 0;
     GLuint dlNightWindows = 0;
     GLuint dlGround = 0; // Sehir adalari, mahalle caddeleri, ara sokaklar, yaya kaldirimlari ve avlular
     bool compiled = false;
@@ -2261,16 +2466,93 @@ static inline void registerBuildingInSpatialHash(int bIdx) {
     }
 }
 
-// O(1) Bina carpismasi testi (ucak govdesi / kanat noktalari icin)
+// O(1) Bina carpismasi testi (dunya uretimi, silah balistigi ve genel sorgu)
+static int findBuildingHitPoint(const Vec3& p, float radius) {
+    int x0 = clampi((int)((p.x - radius - WORLD_X0) / SH_CELL), 0, SH_NX - 1);
+    int x1 = clampi((int)((p.x + radius - WORLD_X0) / SH_CELL), 0, SH_NX - 1);
+    int z0 = clampi((int)((p.z - radius - WORLD_Z0) / SH_CELL), 0, SH_NZ - 1);
+    int z1 = clampi((int)((p.z + radius - WORLD_Z0) / SH_CELL), 0, SH_NZ - 1);
+    for (int gz = z0; gz <= z1; gz++) {
+        for (int gx = x0; gx <= x1; gx++) {
+            for (int idx : g_spatialHash[gz * SH_NX + gx]) {
+                const BuildingInst& b = g_allBuildings[idx];
+                if (p.y - radius > b.y + b.h || p.y + radius < b.y) continue;
+                float dx = p.x - b.x, dz = p.z - b.z;
+                float lx = std::fabs(dx * b.cosY + dz * b.sinY);
+                float lz = std::fabs(-dx * b.sinY + dz * b.cosY);
+                if (lx <= b.w * 0.5f + radius && lz <= b.d * 0.5f + radius) return idx;
+            }
+        }
+    }
+    return -1;
+}
+
 static bool checkBuildingCollision(const Vec3& p, float radius) {
-    int gx = (int)((p.x - WORLD_X0) / SH_CELL);
-    int gz = (int)((p.z - WORLD_Z0) / SH_CELL);
-    if (gx < 0 || gx >= SH_NX || gz < 0 || gz >= SH_NZ) return false;
-    const auto& bucket = g_spatialHash[gz * SH_NX + gx];
-    for (int idx : bucket) {
+    return findBuildingHitPoint(p, radius) >= 0;
+}
+
+// Dinamik 100m carpma penceresi: Ucak cevresinde yalnizca 100m icindeki binalar carpilabilir olur,
+// 100m otesindeki binalar sadece gorsel olarak cizilir; ucak yaklastikca tekrar aktiflesir.
+static const float BLDG_COLLIDE_RADIUS = 100.0f;
+static std::vector<int> g_activeColliders100m;
+static Vec3 g_colliderAnchorPos(1e9f, 1e9f, 1e9f);
+static bool g_collidersDirty = true;
+static std::vector<uint32_t> g_colliderVisitStamp;
+static uint32_t g_colliderStampGen = 1;
+
+static inline float distSqPointToBuildingOBB(const Vec3& p, const BuildingInst& b) {
+    float dx = p.x - b.x, dz = p.z - b.z;
+    float lx = dx * b.cosY + dz * b.sinY;
+    float lz = -dx * b.sinY + dz * b.cosY;
+    float cx = std::max(0.0f, std::fabs(lx) - b.w * 0.5f);
+    float cz = std::max(0.0f, std::fabs(lz) - b.d * 0.5f);
+    float cy = 0.0f;
+    if (p.y < b.y) cy = b.y - p.y;
+    else if (p.y > b.y + b.h) cy = p.y - (b.y + b.h);
+    return cx * cx + cy * cy + cz * cz;
+}
+
+static void refreshActiveColliders100m(const Vec3& acPos) {
+    Vec3 dAnchor = acPos - g_colliderAnchorPos;
+    if (!g_collidersDirty && dot(dAnchor, dAnchor) < 12.0f * 12.0f) return;
+    g_colliderAnchorPos = acPos;
+    g_collidersDirty = false;
+    g_activeColliders100m.clear();
+    if (g_allBuildings.empty()) return;
+    if (g_colliderVisitStamp.size() != g_allBuildings.size()) {
+        g_colliderVisitStamp.assign(g_allBuildings.size(), 0u);
+    }
+    g_colliderStampGen++;
+    if (g_colliderStampGen == 0u) {
+        std::fill(g_colliderVisitStamp.begin(), g_colliderVisitStamp.end(), 0u);
+        g_colliderStampGen = 1u;
+    }
+    const float scanR = BLDG_COLLIDE_RADIUS + 18.0f;
+    int x0 = clampi((int)((acPos.x - scanR - WORLD_X0) / SH_CELL), 0, SH_NX - 1);
+    int x1 = clampi((int)((acPos.x + scanR - WORLD_X0) / SH_CELL), 0, SH_NX - 1);
+    int z0 = clampi((int)((acPos.z - scanR - WORLD_Z0) / SH_CELL), 0, SH_NZ - 1);
+    int z1 = clampi((int)((acPos.z + scanR - WORLD_Z0) / SH_CELL), 0, SH_NZ - 1);
+    const float keepR2 = scanR * scanR;
+    for (int gz = z0; gz <= z1; gz++) {
+        for (int gx = x0; gx <= x1; gx++) {
+            for (int idx : g_spatialHash[gz * SH_NX + gx]) {
+                if (g_colliderVisitStamp[idx] == g_colliderStampGen) continue;
+                g_colliderVisitStamp[idx] = g_colliderStampGen;
+                if (distSqPointToBuildingOBB(acPos, g_allBuildings[idx]) <= keepR2) {
+                    g_activeColliders100m.push_back(idx);
+                }
+            }
+        }
+    }
+}
+
+static bool checkAircraftBuildingCollision100m(const Vec3& testPt, const Vec3& acPos, float radius) {
+    const float maxCollR2 = BLDG_COLLIDE_RADIUS * BLDG_COLLIDE_RADIUS;
+    for (int idx : g_activeColliders100m) {
         const BuildingInst& b = g_allBuildings[idx];
-        if (p.y - radius > b.y + b.h || p.y + radius < b.y) continue;
-        float dx = p.x - b.x, dz = p.z - b.z;
+        if (distSqPointToBuildingOBB(acPos, b) > maxCollR2) continue;
+        if (testPt.y - radius > b.y + b.h || testPt.y + radius < b.y) continue;
+        float dx = testPt.x - b.x, dz = testPt.z - b.z;
         float lx = std::fabs(dx * b.cosY + dz * b.sinY);
         float lz = std::fabs(-dx * b.sinY + dz * b.cosY);
         if (lx <= b.w * 0.5f + radius && lz <= b.d * 0.5f + radius) return true;
@@ -2914,16 +3196,78 @@ static void generateCityBuildingsAndTrees() {
             }
         }
     }
+
+    // Simge kule ve yapilarin (Folkart, Mistral, Hilton, Saat Kulesi, Asansor, Liman, vb.)
+    // 100m carpisma ve silah/bomba fizigine dahil edilmesi (cift cizim yapmadan)
+    auto addColliderOnly = [&](float cx, float baseY, float cz, float w, float d, float h,
+                               float cosY, float sinY, uint8_t btype) {
+        BuildingInst b;
+        b.x = cx; b.y = baseY; b.z = cz;
+        b.w = w; b.d = d; b.h = h;
+        b.cosY = cosY; b.sinY = sinY;
+        b.type = btype;
+        b.colorVar = 0;
+        int bIdx = (int)g_allBuildings.size();
+        g_allBuildings.push_back(b);
+        registerBuildingInSpatialHash(bIdx);
+    };
+    Vec2 fkP = geoPt(FOLKART_LAT, FOLKART_LON);
+    float fkY = sampleTerrainElev(fkP.x, fkP.z);
+    addColliderOnly(fkP.x - 42.0f, fkY, fkP.z, 32.0f, 32.0f, 200.0f, 1, 0, BLDG_TOWER_GLASS);
+    addColliderOnly(fkP.x + 42.0f, fkY, fkP.z, 32.0f, 32.0f, 200.0f, 1, 0, BLDG_TOWER_GLASS);
+    Vec2 msP = geoPt(MISTRAL_LAT, MISTRAL_LON);
+    float msY = sampleTerrainElev(msP.x, msP.z);
+    addColliderOnly(msP.x, msY, msP.z, 34.0f, 28.0f, 216.0f, 1, 0, BLDG_TOWER_GLASS);
+    addColliderOnly(msP.x + 46.0f, msY, msP.z + 18.0f, 28.0f, 26.0f, 154.0f, 1, 0, BLDG_TOWER_GLASS);
+    Vec2 epP = geoPt(EGEPERLA_LAT, EGEPERLA_LON);
+    float epY = sampleTerrainElev(epP.x, epP.z);
+    addColliderOnly(epP.x - 28.0f, epY, epP.z, 28.0f, 24.0f, 186.0f, 1, 0, BLDG_TOWER_GLASS);
+    addColliderOnly(epP.x + 28.0f, epY, epP.z, 26.0f, 22.0f, 142.0f, 1, 0, BLDG_TOWER_GLASS);
+    Vec2 hlP = geoPt(HILTON_LAT, HILTON_LON);
+    addColliderOnly(hlP.x, sampleTerrainElev(hlP.x, hlP.z), hlP.z, 34.0f, 26.0f, 142.0f, 1, 0, BLDG_TOWER_GLASS);
+    Vec2 skP = geoPt(SAAT_LAT, SAAT_LON);
+    float skY = sampleTerrainElev(skP.x, skP.z);
+    addColliderOnly(skP.x, skY, skP.z, 8.0f, 8.0f, 34.0f, 1, 0, BLDG_INSTITUTION);
+    addColliderOnly(skP.x + 52.0f, skY, skP.z - 12.0f, 16.0f, 16.0f, 16.5f, 1, 0, BLDG_MOSQUE);
+    Vec2 kpPier = geoPt(38.4215, 27.1275);
+    addColliderOnly(kpPier.x - 35.0f, 2.2f, kpPier.z, 95.0f, 36.0f, 12.7f, 0.88f, -0.47f, BLDG_HISTORIC_KEMERALTI);
+    Vec2 asP = geoPt(ASANSOR_LAT, ASANSOR_LON);
+    float asY = sampleTerrainElev(asP.x, asP.z);
+    addColliderOnly(asP.x, asY - 4.0f, asP.z, 12.0f, 12.0f, 58.0f, 0.92f, 0.38f, BLDG_HISTORIC_KEMERALTI);
+    addColliderOnly(asP.x, asY + 51.0f, asP.z + 6.0f, 24.0f, 18.0f, 5.5f, 0.92f, 0.38f, BLDG_HISTORIC_KEMERALTI);
+    Vec2 kskA = geoPt(KSK_ANIT_LAT, KSK_ANIT_LON);
+    float kskY = sampleTerrainElev(kskA.x, kskA.z);
+    addColliderOnly(kskA.x, kskY, kskA.z, 16.0f, 14.0f, 42.0f, 0.95f, 0.31f, BLDG_INSTITUTION);
+    Vec2 kultP = geoPt(KULTURPARK_LAT, KULTURPARK_LON);
+    addColliderOnly(kultP.x - 120.0f, sampleTerrainElev(kultP.x - 120.0f, kultP.z + 90.0f), kultP.z + 90.0f, 16.0f, 16.0f, 48.0f, 1, 0, BLDG_INSTITUTION);
+    Vec2 hisP = geoPt(38.4196, 27.1394);
+    addColliderOnly(hisP.x, sampleTerrainElev(hisP.x, hisP.z), hisP.z, 28.0f, 28.0f, 15.0f, 1, 0, BLDG_MOSQUE);
+    Vec2 kzP = geoPt(38.4202, 27.1380);
+    addColliderOnly(kzP.x, sampleTerrainElev(kzP.x, kzP.z), kzP.z, 54.0f, 44.0f, 10.6f, 1, 0, BLDG_HISTORIC_KEMERALTI);
+    Vec2 portP = geoPt(38.4438, 27.1500);
+    float portY = sampleTerrainElev(portP.x, portP.z);
+    for (int c = 0; c < 4; c++) {
+        addColliderOnly(portP.x - 180.0f + c * 135.0f, portY, portP.z + 128.0f, 94.0f, 38.0f, 13.0f, 1, 0, BLDG_FACTORY);
+    }
+    Vec2 shipP = geoPt(38.4445, 27.1388);
+    addColliderOnly(shipP.x, 0.0f, shipP.z, 32.0f, 185.0f, 28.0f, 0.78f, 0.62f, BLDG_INSTITUTION);
 }
 
 // =====================================================================================
 //  STATIK DUNYA VE CITYCHUNK DISPLAY LIST DERLEYICILERI
 // =====================================================================================
-static GLuint g_dlTerrain = 0;
-static GLuint g_dlSea = 0;
+static const int WORLD_TILE_N = 8;
+static const int NUM_WORLD_TILES = WORLD_TILE_N * WORLD_TILE_N;
+static GLuint g_dlTerrainTile[NUM_WORLD_TILES] = {0};
+static GLuint g_dlSeaTile[NUM_WORLD_TILES] = {0};
+static GLuint g_dlRoadTile[NUM_WORLD_TILES] = {0};
+static float g_roadTileRadius[NUM_WORLD_TILES] = {0};
+static GLuint g_dlRails = 0;
+static GLuint g_dlHorizonApron = 0;
 static GLuint g_dlQuayAndPromenade = 0;
-static GLuint g_dlIzbanAndRoads = 0;
 static GLuint g_dlLandmarksAndAirports = 0;
+static std::vector<Vec3> g_nightStreetLights;
+static std::vector<Vec3> g_nightBeaconLights;
 
 static void emitBoxFaces(float x, float y, float z, float w, float d, float h,
                          float cosY, float sinY, float uScale, float vScale, bool capTop = true) {
@@ -3035,7 +3379,7 @@ static void emitRoofQuadOrPitch(const BuildingInst& b) {
         glTexCoord2f(2, 2); glVertex3f(c2.x, y1 + 0.5f, c2.z);
         glTexCoord2f(0, 2); glVertex3f(c3.x, y1 + 0.5f, c3.z);
     } else {
-        // Modern Akdeniz Teras Cati (parapet + asansor kulesi + Gunisi solar su isitma sistemi)
+        // Modern Akdeniz Teras Cati (temel cati kapagi; parapet ve Gunisi detayi dlNearDetails'dedir)
         if (b.type == BLDG_FACTORY) glColor3f(0.55f, 0.65f, 0.78f);
         else if (b.type == BLDG_INSTITUTION) glColor3f(0.84f, 0.86f, 0.88f);
         else glColor3f(0.88f, 0.90f, 0.92f);
@@ -3044,23 +3388,40 @@ static void emitRoofQuadOrPitch(const BuildingInst& b) {
         glTexCoord2f(2, 0); glVertex3f(c1.x, y1, c1.z);
         glTexCoord2f(2, 2); glVertex3f(c2.x, y1, c2.z);
         glTexCoord2f(0, 2); glVertex3f(c3.x, y1, c3.z);
+    }
+}
 
-        bool addRoofDetail = (b.type != BLDG_FACTORY && b.type != BLDG_INSTITUTION &&
-                              (!g_hasV2Roads || (b.w * b.d >= 160.0f && b.h >= 11.0f)));
-        if (addRoofDetail) {
-            glColor3f(0.88f, 0.88f, 0.86f);
-            emitBoxFaces(b.x, y1, b.z, b.w, b.d, 0.75f, b.cosY, b.sinY, 0.04f, 0.04f);
-
-            glColor3f(0.92f, 0.93f, 0.95f);
-            emitBoxFaces(b.x, y1, b.z, b.w * 0.32f, b.d * 0.32f, 2.4f, b.cosY, b.sinY, 0.1f, 0.1f);
-
-            float panW = b.w * 0.22f, panD = b.d * 0.18f;
-            Vec2 panPos = Vec2(b.x, b.z) + r * (b.w * 0.22f) - f * (b.d * 0.18f);
-            glColor3f(0.20f, 0.22f, 0.26f);
-            emitBoxFaces(panPos.x, y1 + 0.45f, panPos.z, panW, panD, 0.60f, b.cosY, b.sinY, 0.05f, 0.05f);
-            glColor3f(0.86f, 0.89f, 0.92f);
-            emitBoxFaces(panPos.x, y1 + 1.10f, panPos.z - f.z * 0.8f, panW * 0.82f, 0.9f, 0.70f, b.cosY, b.sinY, 0.05f, 0.05f);
-        }
+static void emitNearRoofDetailAndBalcony(const BuildingInst& b) {
+    Vec2 r(b.cosY, b.sinY), f(-b.sinY, b.cosY);
+    float y1 = b.y + b.h;
+    if (b.type == BLDG_HISTORIC_KEMERALTI) {
+        glColor3f(0.52f, 0.32f, 0.20f);
+        emitBoxFaces(b.x, b.y + b.h * 0.55f, b.z, b.w + 0.65f, b.d + 0.65f, 0.35f, b.cosY, b.sinY, 0.04f, 0.04f, false);
+        return;
+    }
+    if ((b.type == BLDG_APT_COAST || b.type == BLDG_URBAN_APT) && b.h >= 14.0f && b.w * b.d >= 160.0f) {
+        glColor3f(0.96f, 0.95f, 0.92f);
+        emitBoxFaces(b.x, b.y + b.h * 0.48f, b.z, b.w + 0.70f, b.d + 0.70f, 0.40f, b.cosY, b.sinY, 0.04f, 0.04f, false);
+        emitBoxFaces(b.x, b.y + b.h - 0.55f, b.z, b.w + 0.85f, b.d + 0.85f, 0.48f, b.cosY, b.sinY, 0.04f, 0.04f, false);
+    } else if ((b.type == BLDG_MAVISEHIR_RES || b.type == BLDG_TOWER_GLASS) && b.h >= 24.0f) {
+        glColor3f(0.92f, 0.95f, 0.99f);
+        emitBoxFaces(b.x, b.y + b.h * 0.50f, b.z, b.w + 0.80f, b.d + 0.80f, 0.52f, b.cosY, b.sinY, 0.05f, 0.04f, false);
+        emitBoxFaces(b.x, b.y + b.h - 0.70f, b.z, b.w + 1.00f, b.d + 1.00f, 0.62f, b.cosY, b.sinY, 0.05f, 0.04f, false);
+    }
+    if (b.type != BLDG_FACTORY && b.type != BLDG_INSTITUTION &&
+        b.type != BLDG_HISTORIC_KEMERALTI && b.type != BLDG_HILLSIDE_HOUSE &&
+        b.type != BLDG_MOSQUE && b.type != BLDG_GREENHOUSE &&
+        b.w * b.d >= 150.0f && b.h >= 10.0f) {
+        glColor3f(0.88f, 0.88f, 0.86f);
+        emitBoxFaces(b.x, y1, b.z, b.w, b.d, 0.72f, b.cosY, b.sinY, 0.04f, 0.04f);
+        glColor3f(0.92f, 0.93f, 0.95f);
+        emitBoxFaces(b.x, y1, b.z, b.w * 0.30f, b.d * 0.30f, 2.3f, b.cosY, b.sinY, 0.1f, 0.1f);
+        float panW = b.w * 0.22f, panD = b.d * 0.18f;
+        Vec2 panPos = Vec2(b.x, b.z) + r * (b.w * 0.22f) - f * (b.d * 0.18f);
+        glColor3f(0.20f, 0.22f, 0.26f);
+        emitBoxFaces(panPos.x, y1 + 0.45f, panPos.z, panW, panD, 0.58f, b.cosY, b.sinY, 0.05f, 0.05f);
+        glColor3f(0.86f, 0.89f, 0.92f);
+        emitBoxFaces(panPos.x, y1 + 1.08f, panPos.z - f.z * 0.8f, panW * 0.82f, 0.9f, 0.68f, b.cosY, b.sinY, 0.05f, 0.05f);
     }
 }
 
@@ -3070,7 +3431,8 @@ static void compileChunkIfNeeded(CityChunk& ck) {
     int ckIdx = (int)(&ck - g_cityChunks.data());
     bool hasV2R = (ckIdx >= 0 && ckIdx < (int)g_chunkV2Roads.size() && !g_chunkV2Roads[ckIdx].empty());
     bool hasGard = (ckIdx >= 0 && ckIdx < (int)g_chunkGardens.size() && !g_chunkGardens[ckIdx].empty());
-    if (ck.bldgs.empty() && ck.trees.empty() && !hasV2R) return;
+    bool hasSide = (!g_hasV2Roads && ckIdx >= 0 && ckIdx < (int)g_chunkSideStreets.size() && !g_chunkSideStreets[ckIdx].empty());
+    if (ck.bldgs.empty() && ck.trees.empty() && !hasV2R && !hasGard && !hasSide) return;
 
     // 0. Sehir Adalari, Mahalle Caddeleri, Ara Sokaklar, Sanayi Sahalari, Kaldirimlar ve Bahceler
     if (!ck.bldgs.empty() || hasV2R || hasGard) {
@@ -3092,9 +3454,17 @@ static void compileChunkIfNeeded(CityChunk& ck) {
                 float hw = std::max(1.8f, seg.halfW);
                 Vec2 p0 = seg.a - norm * hw, p1 = seg.b - norm * hw;
                 Vec2 p2 = seg.b + norm * hw, p3 = seg.a + norm * hw;
-                float dy = (seg.level > 0) ? (0.28f + 3.2f * seg.level) : 0.14f;
-                float y0 = sampleTerrainElev(seg.a.x, seg.a.z) + dy;
-                float y1 = sampleTerrainElev(seg.b.x, seg.b.z) + dy;
+                Vec2 mid = (seg.a + seg.b) * 0.5f;
+                float dy = (seg.level > 0) ? (0.36f + 3.2f * seg.level) : 0.34f;
+                float e0L = sampleRenderedTerrainMaxElev(p0.x, p0.z);
+                float e0C = sampleRenderedTerrainMaxElev(seg.a.x, seg.a.z);
+                float e0R = sampleRenderedTerrainMaxElev(p3.x, p3.z);
+                float e1L = sampleRenderedTerrainMaxElev(p1.x, p1.z);
+                float e1C = sampleRenderedTerrainMaxElev(seg.b.x, seg.b.z);
+                float e1R = sampleRenderedTerrainMaxElev(p2.x, p2.z);
+                float eMC = sampleRenderedTerrainMaxElev(mid.x, mid.z);
+                float y0 = std::max(std::max(e0C, std::max(e0L, e0R)), eMC - 0.15f) + dy;
+                float y1 = std::max(std::max(e1C, std::max(e1L, e1R)), eMC - 0.15f) + dy;
                 if (seg.tier <= 3) glColor3f(0.68f, 0.70f, 0.74f);
                 else glColor3f(0.76f, 0.78f, 0.81f);
                 glNormal3f(0.0f, 1.0f, 0.0f);
@@ -3102,6 +3472,19 @@ static void compileChunkIfNeeded(CityChunk& ck) {
                 glTexCoord2f(l * 0.12f, 0.0f); glVertex3f(p1.x, y1, p1.z);
                 glTexCoord2f(l * 0.12f, 1.0f); glVertex3f(p2.x, y1, p2.z);
                 glTexCoord2f(0.0f, 1.0f); glVertex3f(p3.x, y0, p3.z);
+                if (std::fabs(e0L - e0R) > 0.30f || std::fabs(e1L - e1R) > 0.30f || seg.level > 0) {
+                    glColor3f(0.45f, 0.44f, 0.42f);
+                    glNormal3f(-norm.x, 0.25f, -norm.z);
+                    glTexCoord2f(0.0f, 0.0f); glVertex3f(p0.x, y0, p0.z);
+                    glTexCoord2f(0.0f, 1.0f); glVertex3f(p0.x, y0 - 1.6f, p0.z);
+                    glTexCoord2f(l * 0.12f, 1.0f); glVertex3f(p1.x, y1 - 1.6f, p1.z);
+                    glTexCoord2f(l * 0.12f, 0.0f); glVertex3f(p1.x, y1, p1.z);
+                    glNormal3f(norm.x, 0.25f, norm.z);
+                    glTexCoord2f(0.0f, 0.0f); glVertex3f(p2.x, y1, p2.z);
+                    glTexCoord2f(0.0f, 1.0f); glVertex3f(p2.x, y1 - 1.6f, p2.z);
+                    glTexCoord2f(l * 0.12f, 1.0f); glVertex3f(p3.x, y0 - 1.6f, p3.z);
+                    glTexCoord2f(l * 0.12f, 0.0f); glVertex3f(p3.x, y0, p3.z);
+                }
             }
             glEnd();
         } else if (ckIdx >= 0 && ckIdx < (int)g_chunkSideStreets.size() && !g_chunkSideStreets[ckIdx].empty()) {
@@ -3225,220 +3608,289 @@ static void compileChunkIfNeeded(CityChunk& ck) {
         glEndList();
     }
 
-    // 1. Apartman, yamac evi, Kemeralti, cami ve okul/hastane cepheleri
-    ck.dlApt = glGenLists(1);
-    glNewList(ck.dlApt, GL_COMPILE);
-    glBegin(GL_QUADS);
+    // 1. Apartman, yamac evi, Kemeralti, cami ve okul/hastane cepheleri (capTop=false -> cati dlRoof/dlTileRoof'da)
+    bool hasApt = false, hasGlass = false, hasInd = false, hasFlatRoof = false, hasTileRoof = false;
+    bool hasNearDetail = false, hasSkyline = false, hasNight = false;
     for (const auto& b : ck.bldgs) {
-        if (b.type == BLDG_FACTORY || b.type == BLDG_MAVISEHIR_RES || b.type == BLDG_TOWER_GLASS) continue;
-        if (b.type == BLDG_MOSQUE) {
-            glColor3f(0.95f, 0.91f, 0.82f);
-            emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h * 0.72f, b.cosY, b.sinY, 0.04f, 0.04f, false);
-            if (std::min(b.w, b.d) >= 8.0f) {
-                Vec2 r(b.cosY, b.sinY), f(-b.sinY, b.cosY);
-                Vec2 mp = Vec2(b.x, b.z) + r * (b.w * 0.42f) - f * (b.d * 0.42f);
-                glColor3f(0.98f, 0.96f, 0.92f);
-                emitBoxFaces(mp.x, b.y, mp.z, 2.3f, 2.3f, b.h * 0.35f, b.cosY, b.sinY, 0.08f, 0.08f, true);
-                emitBoxFaces(mp.x, b.y, mp.z, 1.50f, 1.50f, b.h * 1.15f + 12.0f, b.cosY, b.sinY, 0.08f, 0.08f, false);
-                glColor3f(0.92f, 0.88f, 0.78f);
-                emitBoxFaces(mp.x, b.y + b.h * 1.15f + 7.0f, mp.z, 2.4f, 2.4f, 0.75f, b.cosY, b.sinY, 0.08f, 0.08f, true);
-            }
-            continue;
-        }
-        if (b.type == BLDG_INSTITUTION) {
-            static const float instTint[4][3] = {
-                {0.93f, 0.90f, 0.86f}, {0.88f, 0.91f, 0.94f}, {0.94f, 0.89f, 0.84f}, {0.90f, 0.92f, 0.90f}
-            };
-            const float* tc = instTint[b.colorVar & 3];
-            glColor3f(tc[0], tc[1], tc[2]);
-            emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.04f, 0.035f, false);
-            continue;
-        }
-        if (b.type == BLDG_GREENHOUSE) {
-            glColor3f(0.84f, 0.93f, 0.96f);
-            emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.05f, 0.05f, false);
-            continue;
-        }
-        if (b.type == BLDG_HISTORIC_KEMERALTI) {
-            static const float histTint[4][3] = {
-                {0.92f, 0.84f, 0.70f}, {0.88f, 0.76f, 0.62f}, {0.86f, 0.72f, 0.58f}, {0.94f, 0.88f, 0.78f}
-            };
-            const float* tc = histTint[b.colorVar & 3];
-            glColor3f(tc[0], tc[1], tc[2]);
-            emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.04f, 0.035f, false);
-            glColor3f(0.52f, 0.32f, 0.20f);
-            emitBoxFaces(b.x, b.y + b.h * 0.55f, b.z, b.w + 0.65f, b.d + 0.65f, 0.35f, b.cosY, b.sinY, 0.04f, 0.04f, false);
-            continue;
-        }
-        static const float tint[8][3] = {
-            {0.97f, 0.95f, 0.91f}, {0.95f, 0.89f, 0.82f}, {0.88f, 0.92f, 0.96f}, {0.95f, 0.85f, 0.80f},
-            {0.92f, 0.94f, 0.89f}, {0.90f, 0.88f, 0.85f}, {0.98f, 0.92f, 0.84f}, {0.86f, 0.90f, 0.93f}
-        };
-        const float* tc = tint[b.colorVar & 7];
-        glColor3f(tc[0], tc[1], tc[2]);
-        emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.045f, 0.038f, false);
-        if ((b.type == BLDG_APT_COAST || b.type == BLDG_URBAN_APT) &&
-            (!g_hasV2Roads || (b.h >= 16.0f && b.w * b.d >= 180.0f && (((int)b.x & 1) == 0)))) {
-            glColor3f(std::min(1.0f, tc[0] + 0.04f), std::min(1.0f, tc[1] + 0.04f), std::min(1.0f, tc[2] + 0.04f));
-            emitBoxFaces(b.x, b.y + b.h * 0.45f, b.z, b.w + 0.70f, b.d + 0.70f, 0.42f, b.cosY, b.sinY, 0.04f, 0.04f, false);
-            emitBoxFaces(b.x, b.y + b.h - 0.55f, b.z, b.w + 0.85f, b.d + 0.85f, 0.50f, b.cosY, b.sinY, 0.04f, 0.04f, false);
-        }
+        if (b.type == BLDG_FACTORY) hasInd = true;
+        else if (b.type == BLDG_MAVISEHIR_RES || b.type == BLDG_TOWER_GLASS) hasGlass = true;
+        else hasApt = true;
+        bool pitched = (b.type == BLDG_HISTORIC_KEMERALTI) || (b.type == BLDG_HILLSIDE_HOUSE);
+        if (pitched) hasTileRoof = true; else hasFlatRoof = true;
+        if (b.h >= 9.0f || b.type == BLDG_TOWER_GLASS || b.type == BLDG_MAVISEHIR_RES || b.type == BLDG_MOSQUE) hasSkyline = true;
+        if (b.h >= 5.5f && b.type != BLDG_MOSQUE && b.type != BLDG_GREENHOUSE) hasNight = true;
+        if (b.type == BLDG_HISTORIC_KEMERALTI || b.h >= 10.0f) hasNearDetail = true;
     }
-    glEnd();
-    glEndList();
+
+    if (hasApt) {
+        ck.dlApt = glGenLists(1);
+        glNewList(ck.dlApt, GL_COMPILE);
+        glBegin(GL_QUADS);
+        for (const auto& b : ck.bldgs) {
+            if (b.type == BLDG_FACTORY || b.type == BLDG_MAVISEHIR_RES || b.type == BLDG_TOWER_GLASS) continue;
+            if (b.type == BLDG_MOSQUE) {
+                glColor3f(0.95f, 0.91f, 0.82f);
+                emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h * 0.72f, b.cosY, b.sinY, 0.04f, 0.04f, false);
+                if (std::min(b.w, b.d) >= 8.0f) {
+                    Vec2 r(b.cosY, b.sinY), f(-b.sinY, b.cosY);
+                    Vec2 mp = Vec2(b.x, b.z) + r * (b.w * 0.42f) - f * (b.d * 0.42f);
+                    glColor3f(0.98f, 0.96f, 0.92f);
+                    emitBoxFaces(mp.x, b.y, mp.z, 2.3f, 2.3f, b.h * 0.35f, b.cosY, b.sinY, 0.08f, 0.08f, true);
+                    emitBoxFaces(mp.x, b.y, mp.z, 1.50f, 1.50f, b.h * 1.15f + 12.0f, b.cosY, b.sinY, 0.08f, 0.08f, false);
+                    glColor3f(0.92f, 0.88f, 0.78f);
+                    emitBoxFaces(mp.x, b.y + b.h * 1.15f + 7.0f, mp.z, 2.4f, 2.4f, 0.75f, b.cosY, b.sinY, 0.08f, 0.08f, true);
+                }
+                continue;
+            }
+            if (b.type == BLDG_INSTITUTION) {
+                static const float instTint[4][3] = {
+                    {0.93f, 0.90f, 0.86f}, {0.88f, 0.91f, 0.94f}, {0.94f, 0.89f, 0.84f}, {0.90f, 0.92f, 0.90f}
+                };
+                const float* tc = instTint[b.colorVar & 3];
+                glColor3f(tc[0], tc[1], tc[2]);
+                emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.04f, 0.035f, false);
+                continue;
+            }
+            if (b.type == BLDG_GREENHOUSE) {
+                glColor3f(0.84f, 0.93f, 0.96f);
+                emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.05f, 0.05f, false);
+                continue;
+            }
+            if (b.type == BLDG_HISTORIC_KEMERALTI) {
+                static const float histTint[4][3] = {
+                    {0.92f, 0.84f, 0.70f}, {0.88f, 0.76f, 0.62f}, {0.86f, 0.72f, 0.58f}, {0.94f, 0.88f, 0.78f}
+                };
+                const float* tc = histTint[b.colorVar & 3];
+                glColor3f(tc[0], tc[1], tc[2]);
+                emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.04f, 0.035f, false);
+                continue;
+            }
+            static const float tint[8][3] = {
+                {0.97f, 0.95f, 0.91f}, {0.95f, 0.89f, 0.82f}, {0.88f, 0.92f, 0.96f}, {0.95f, 0.85f, 0.80f},
+                {0.92f, 0.94f, 0.89f}, {0.90f, 0.88f, 0.85f}, {0.98f, 0.92f, 0.84f}, {0.86f, 0.90f, 0.93f}
+            };
+            const float* tc = tint[b.colorVar & 7];
+            glColor3f(tc[0], tc[1], tc[2]);
+            emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.045f, 0.038f, false);
+        }
+        glEnd();
+        glEndList();
+    }
 
     // 2. Mavisehir rezidans ve Bayrakli cam kuleleri
-    ck.dlGlass = glGenLists(1);
-    glNewList(ck.dlGlass, GL_COMPILE);
-    glBegin(GL_QUADS);
-    for (const auto& b : ck.bldgs) {
-        if (b.type != BLDG_MAVISEHIR_RES && b.type != BLDG_TOWER_GLASS) continue;
-        if (b.type == BLDG_MAVISEHIR_RES) {
-            int cv = b.colorVar & 3;
-            if (cv == 0) glColor3f(0.92f, 0.90f, 0.85f);
-            else if (cv == 1) glColor3f(0.84f, 0.89f, 0.95f);
-            else if (cv == 2) glColor3f(0.95f, 0.88f, 0.78f);
-            else glColor3f(0.86f, 0.92f, 0.90f);
-        } else {
-            glColor3f(0.72f, 0.86f, 0.98f);
+    if (hasGlass) {
+        ck.dlGlass = glGenLists(1);
+        glNewList(ck.dlGlass, GL_COMPILE);
+        glBegin(GL_QUADS);
+        for (const auto& b : ck.bldgs) {
+            if (b.type != BLDG_MAVISEHIR_RES && b.type != BLDG_TOWER_GLASS) continue;
+            if (b.type == BLDG_MAVISEHIR_RES) {
+                int cv = b.colorVar & 3;
+                if (cv == 0) glColor3f(0.92f, 0.90f, 0.85f);
+                else if (cv == 1) glColor3f(0.84f, 0.89f, 0.95f);
+                else if (cv == 2) glColor3f(0.95f, 0.88f, 0.78f);
+                else glColor3f(0.86f, 0.92f, 0.90f);
+            } else {
+                glColor3f(0.76f, 0.89f, 0.99f);
+            }
+            emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.055f, 0.042f, false);
         }
-        emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.055f, 0.042f, false);
-        if (b.h >= 24.0f) {
-            glColor3f(0.92f, 0.95f, 0.99f);
-            emitBoxFaces(b.x, b.y + b.h * 0.50f, b.z, b.w + 0.8f, b.d + 0.8f, 0.55f, b.cosY, b.sinY, 0.05f, 0.04f, false);
-            emitBoxFaces(b.x, b.y + b.h - 0.70f, b.z, b.w + 1.0f, b.d + 1.0f, 0.65f, b.cosY, b.sinY, 0.05f, 0.04f, false);
-        }
+        glEnd();
+        glEndList();
     }
-    glEnd();
-    glEndList();
 
     // 3. Cigli AOSB / Ata Sanayi fabrika holleri
-    ck.dlInd = glGenLists(1);
-    glNewList(ck.dlInd, GL_COMPILE);
-    glBegin(GL_QUADS);
-    for (const auto& b : ck.bldgs) {
-        if (b.type != BLDG_FACTORY) continue;
-        if (b.colorVar & 1) glColor3f(0.62f, 0.74f, 0.88f);
-        else glColor3f(0.76f, 0.79f, 0.83f);
-        emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.035f, 0.05f, false);
-    }
-    glEnd();
-    glEndList();
-
-    // 4. Catilar + 4 Farkli Hacimsel 3D Ege Agac Turu
-    ck.dlRoofAndTrees = glGenLists(1);
-    glNewList(ck.dlRoofAndTrees, GL_COMPILE);
-
-    // 4A. Modern Akdeniz Teras Catilari (Beton / Granit doku, parapet, asansor ve Gunisi)
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_tex[TEX_CONCRETE]);
-    glBegin(GL_QUADS);
-    for (const auto& b : ck.bldgs) {
-        bool pitched = (b.type == BLDG_HISTORIC_KEMERALTI) || (b.type == BLDG_HILLSIDE_HOUSE);
-        if (!pitched) emitRoofQuadOrPitch(b);
-    }
-    glEnd();
-
-    // 4B. Tarihi Kemeralti ve Kadifekale Kiremit Kirma Catilari (Terracotta Dokusu)
-    glBindTexture(GL_TEXTURE_2D, g_tex[TEX_ROOF_TILE]);
-    glBegin(GL_QUADS);
-    for (const auto& b : ck.bldgs) {
-        bool pitched = (b.type == BLDG_HISTORIC_KEMERALTI) || (b.type == BLDG_HILLSIDE_HOUSE);
-        if (pitched) emitRoofQuadOrPitch(b);
-    }
-    glEnd();
-
-    // 4C. Hacimsel 3D Ege Agaclari (0: Kizilcam/Fistikcami, 1: Ege Selvisi, 2: Kordon Palmiyesi, 3: Zeytin/Cinar)
-    if (!ck.trees.empty()) {
-        glDisable(GL_TEXTURE_2D);
-        // 3D Agac Govdeleri
-        glColor3f(0.40f, 0.26f, 0.15f);
+    if (hasInd) {
+        ck.dlInd = glGenLists(1);
+        glNewList(ck.dlInd, GL_COMPILE);
         glBegin(GL_QUADS);
-        for (const auto& t : ck.trees) {
-            float trW = (t.kind == 2) ? 0.36f : 0.52f;
-            float trH = (t.kind == 2) ? (t.h * 0.78f) : (t.h * 0.34f);
-            glNormal3f(0.0f, 0.2f, 1.0f);
-            glVertex3f(t.x - trW, t.y, t.z); glVertex3f(t.x + trW, t.y, t.z);
-            glVertex3f(t.x + trW * 0.65f, t.y + trH, t.z); glVertex3f(t.x - trW * 0.65f, t.y + trH, t.z);
-            glNormal3f(1.0f, 0.2f, 0.0f);
-            glVertex3f(t.x, t.y, t.z - trW); glVertex3f(t.x, t.y, t.z + trW);
-            glVertex3f(t.x, t.y + trH, t.z + trW * 0.65f); glVertex3f(t.x, t.y + trH, t.z - trW * 0.65f);
+        for (const auto& b : ck.bldgs) {
+            if (b.type != BLDG_FACTORY) continue;
+            if (b.colorVar & 1) glColor3f(0.62f, 0.74f, 0.88f);
+            else glColor3f(0.76f, 0.79f, 0.83f);
+            emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.035f, 0.05f, false);
         }
         glEnd();
+        glEndList();
+    }
 
-        // 3D Hacimsel Agac Taclari
-        glBegin(GL_TRIANGLES);
-        for (const auto& t : ck.trees) {
-            if (t.kind == 2) {
-                // Kordon / Karsiyaka Palmiyesi: 6 yone kavisli uzanan 3D palmiye yapraklari (fronds)
-                float topY = t.y + t.h * 0.80f;
-                float crownY = t.y + t.h * 0.96f;
-                static const float c6[6] = {1.0f, 0.5f, -0.5f, -1.0f, -0.5f, 0.5f};
-                static const float s6[6] = {0.0f, 0.866f, 0.866f, 0.0f, -0.866f, -0.866f};
-                for (int f = 0; f < 6; f++) {
-                    float dx = c6[f], dz = s6[f];
-                    float px = -dz * 0.75f, pz = dx * 0.75f;
-                    float midX = t.x + dx * (t.r * 0.62f), midZ = t.z + dz * (t.r * 0.62f);
-                    float tipX = t.x + dx * (t.r * 1.18f), tipZ = t.z + dz * (t.r * 1.18f);
-                    float tipY = topY - t.r * 0.28f;
-                    glNormal3f(dx * 0.4f, 0.9f, dz * 0.4f);
-                    glColor3f(0.20f, 0.58f, 0.18f);
-                    glVertex3f(t.x, topY, t.z);
-                    glVertex3f(midX + px, crownY, midZ + pz);
-                    glVertex3f(midX - px, crownY, midZ - pz);
+    // 4A. Modern Akdeniz Teras Catilari (tek glBindTexture ile batchlenmis)
+    if (hasFlatRoof) {
+        ck.dlRoof = glGenLists(1);
+        glNewList(ck.dlRoof, GL_COMPILE);
+        glBegin(GL_QUADS);
+        for (const auto& b : ck.bldgs) {
+            bool pitched = (b.type == BLDG_HISTORIC_KEMERALTI) || (b.type == BLDG_HILLSIDE_HOUSE);
+            if (!pitched) emitRoofQuadOrPitch(b);
+        }
+        glEnd();
+        glEndList();
+    }
 
-                    glColor3f(0.28f, 0.66f, 0.22f);
-                    glVertex3f(midX + px, crownY, midZ + pz);
-                    glVertex3f(tipX, tipY, tipZ);
-                    glVertex3f(midX - px, crownY, midZ - pz);
-                }
-            } else if (t.kind == 1) {
-                // Ege Selvisi: Uzun konik 4-yuzlu 3D selvi piramidi
-                float y0 = t.y + t.h * 0.18f;
-                float yTop = t.y + t.h * 1.05f;
-                float r = t.r * 0.46f;
-                Vec3 p0(t.x - r, y0, t.z - r), p1(t.x + r, y0, t.z - r);
-                Vec3 p2(t.x + r, y0, t.z + r), p3(t.x - r, y0, t.z + r);
-                Vec3 apex(t.x, yTop, t.z);
-                glColor3f(0.10f, 0.36f, 0.14f);
-                glNormal3f(0.0f, 0.35f, -0.94f); glVertex3f(p0.x, p0.y, p0.z); glVertex3f(p1.x, p1.y, p1.z); glVertex3f(apex.x, apex.y, apex.z);
-                glNormal3f(0.94f, 0.35f, 0.0f);  glVertex3f(p1.x, p1.y, p1.z); glVertex3f(p2.x, p2.y, p2.z); glVertex3f(apex.x, apex.y, apex.z);
-                glColor3f(0.14f, 0.44f, 0.18f);
-                glNormal3f(0.0f, 0.35f, 0.94f);  glVertex3f(p2.x, p2.y, p2.z); glVertex3f(p3.x, p3.y, p3.z); glVertex3f(apex.x, apex.y, apex.z);
-                glNormal3f(-0.94f, 0.35f, 0.0f); glVertex3f(p3.x, p3.y, p3.z); glVertex3f(p0.x, p0.y, p0.z); glVertex3f(apex.x, apex.y, apex.z);
-            } else {
-                // Kizilcam / Fistikcami (kind == 0) ve Zeytin / Cinar (kind == 3):
-                // 2 katmanli 3D 4-yuzlu hacimsel semsiye/kubbe piramit
-                for (int tier = 0; tier < 2; tier++) {
-                    float yBase = t.y + t.h * (tier == 0 ? 0.28f : 0.54f);
-                    float yPeak = t.y + t.h * (tier == 0 ? 0.78f : 1.04f);
-                    float rad = t.r * (tier == 0 ? 0.95f : 0.72f);
-                    if (t.kind == 0) {
-                        if (tier == 0) glColor3f(0.14f, 0.44f, 0.16f);
-                        else           glColor3f(0.20f, 0.54f, 0.20f);
-                    } else {
-                        if (tier == 0) glColor3f(0.28f, 0.46f, 0.24f);
-                        else           glColor3f(0.36f, 0.55f, 0.30f);
+    // 4B. Tarihi Kemeralti ve Kadifekale Kiremit Kirma Catilari
+    if (hasTileRoof) {
+        ck.dlTileRoof = glGenLists(1);
+        glNewList(ck.dlTileRoof, GL_COMPILE);
+        glBegin(GL_QUADS);
+        for (const auto& b : ck.bldgs) {
+            bool pitched = (b.type == BLDG_HISTORIC_KEMERALTI) || (b.type == BLDG_HILLSIDE_HOUSE);
+            if (pitched) emitRoofQuadOrPitch(b);
+        }
+        glEnd();
+        glEndList();
+    }
+
+    // 4C. Yakin LOD Mimari Detaylar + Katmanli 3D Ege Agaclari (< 3.4km)
+    if (hasNearDetail || !ck.trees.empty()) {
+        ck.dlNearDetails = glGenLists(1);
+        glNewList(ck.dlNearDetails, GL_COMPILE);
+        if (hasNearDetail) {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, g_tex[TEX_CONCRETE]);
+            glBegin(GL_QUADS);
+            for (const auto& b : ck.bldgs) emitNearRoofDetailAndBalcony(b);
+            glEnd();
+        }
+        if (!ck.trees.empty()) {
+            glDisable(GL_TEXTURE_2D);
+            glColor3f(0.40f, 0.26f, 0.15f);
+            glBegin(GL_QUADS);
+            for (const auto& t : ck.trees) {
+                float trW = (t.kind == 2) ? 0.38f : 0.52f;
+                float trH = (t.kind == 2) ? (t.h * 0.80f) : (t.h * 0.34f);
+                glNormal3f(0.0f, 0.2f, 1.0f);
+                glVertex3f(t.x - trW, t.y, t.z); glVertex3f(t.x + trW, t.y, t.z);
+                glVertex3f(t.x + trW * 0.65f, t.y + trH, t.z); glVertex3f(t.x - trW * 0.65f, t.y + trH, t.z);
+                glNormal3f(1.0f, 0.2f, 0.0f);
+                glVertex3f(t.x, t.y, t.z - trW); glVertex3f(t.x, t.y, t.z + trW);
+                glVertex3f(t.x, t.y + trH, t.z + trW * 0.65f); glVertex3f(t.x, t.y + trH, t.z - trW * 0.65f);
+            }
+            glEnd();
+
+            glBegin(GL_TRIANGLES);
+            for (const auto& t : ck.trees) {
+                if (t.kind == 2) {
+                    float topY = t.y + t.h * 0.80f;
+                    float crownY = t.y + t.h * 0.98f;
+                    static const float c6[6] = {1.0f, 0.5f, -0.5f, -1.0f, -0.5f, 0.5f};
+                    static const float s6[6] = {0.0f, 0.866f, 0.866f, 0.0f, -0.866f, -0.866f};
+                    for (int f = 0; f < 6; f++) {
+                        float dx = c6[f], dz = s6[f];
+                        float px = -dz * 0.75f, pz = dx * 0.75f;
+                        float midX = t.x + dx * (t.r * 0.62f), midZ = t.z + dz * (t.r * 0.62f);
+                        float tipX = t.x + dx * (t.r * 1.22f), tipZ = t.z + dz * (t.r * 1.22f);
+                        float tipY = topY - t.r * 0.30f;
+                        glNormal3f(dx * 0.4f, 0.9f, dz * 0.4f);
+                        glColor3f(0.18f, 0.56f, 0.16f);
+                        glVertex3f(t.x, topY, t.z); glVertex3f(midX + px, crownY, midZ + pz); glVertex3f(midX - px, crownY, midZ - pz);
+                        glColor3f(0.28f, 0.68f, 0.22f);
+                        glVertex3f(midX + px, crownY, midZ + pz); glVertex3f(tipX, tipY, tipZ); glVertex3f(midX - px, crownY, midZ - pz);
                     }
-                    Vec3 p0(t.x - rad, yBase, t.z), p1(t.x, yBase, t.z - rad);
-                    Vec3 p2(t.x + rad, yBase, t.z), p3(t.x, yBase, t.z + rad);
-                    Vec3 apex(t.x, yPeak, t.z);
-                    glNormal3f(-0.6f, 0.55f, -0.6f); glVertex3f(p0.x, p0.y, p0.z); glVertex3f(p1.x, p1.y, p1.z); glVertex3f(apex.x, apex.y, apex.z);
-                    glNormal3f( 0.6f, 0.55f, -0.6f); glVertex3f(p1.x, p1.y, p1.z); glVertex3f(p2.x, p2.y, p2.z); glVertex3f(apex.x, apex.y, apex.z);
-                    glNormal3f( 0.6f, 0.55f,  0.6f); glVertex3f(p2.x, p2.y, p2.z); glVertex3f(p3.x, p3.y, p3.z); glVertex3f(apex.x, apex.y, apex.z);
-                    glNormal3f(-0.6f, 0.55f,  0.6f); glVertex3f(p3.x, p3.y, p3.z); glVertex3f(p0.x, p0.y, p0.z); glVertex3f(apex.x, apex.y, apex.z);
+                } else if (t.kind == 1) {
+                    float y0 = t.y + t.h * 0.18f;
+                    float yTop = t.y + t.h * 1.06f;
+                    float r = t.r * 0.46f;
+                    Vec3 p0(t.x - r, y0, t.z - r), p1(t.x + r, y0, t.z - r);
+                    Vec3 p2(t.x + r, y0, t.z + r), p3(t.x - r, y0, t.z + r);
+                    Vec3 apex(t.x, yTop, t.z);
+                    glColor3f(0.10f, 0.36f, 0.14f);
+                    glNormal3f(0.0f, 0.35f, -0.94f); glVertex3f(p0.x, p0.y, p0.z); glVertex3f(p1.x, p1.y, p1.z); glVertex3f(apex.x, apex.y, apex.z);
+                    glNormal3f(0.94f, 0.35f, 0.0f);  glVertex3f(p1.x, p1.y, p1.z); glVertex3f(p2.x, p2.y, p2.z); glVertex3f(apex.x, apex.y, apex.z);
+                    glColor3f(0.14f, 0.44f, 0.18f);
+                    glNormal3f(0.0f, 0.35f, 0.94f);  glVertex3f(p2.x, p2.y, p2.z); glVertex3f(p3.x, p3.y, p3.z); glVertex3f(apex.x, apex.y, apex.z);
+                    glNormal3f(-0.94f, 0.35f, 0.0f); glVertex3f(p3.x, p3.y, p3.z); glVertex3f(p0.x, p0.y, p0.z); glVertex3f(apex.x, apex.y, apex.z);
+                } else {
+                    for (int tier = 0; tier < 2; tier++) {
+                        float yBase = t.y + t.h * (tier == 0 ? 0.28f : 0.56f);
+                        float yPeak = t.y + t.h * (tier == 0 ? 0.78f : 1.05f);
+                        float rad = t.r * (tier == 0 ? 0.95f : 0.72f);
+                        if (t.kind == 0) glColor3f(tier == 0 ? 0.14f : 0.20f, tier == 0 ? 0.44f : 0.56f, tier == 0 ? 0.16f : 0.20f);
+                        else             glColor3f(tier == 0 ? 0.26f : 0.36f, tier == 0 ? 0.46f : 0.56f, tier == 0 ? 0.22f : 0.28f);
+                        Vec3 p0(t.x - rad, yBase, t.z), p1(t.x, yBase, t.z - rad);
+                        Vec3 p2(t.x + rad, yBase, t.z), p3(t.x, yBase, t.z + rad);
+                        Vec3 apex(t.x, yPeak, t.z);
+                        glNormal3f(-0.6f, 0.55f, -0.6f); glVertex3f(p0.x, p0.y, p0.z); glVertex3f(p1.x, p1.y, p1.z); glVertex3f(apex.x, apex.y, apex.z);
+                        glNormal3f( 0.6f, 0.55f, -0.6f); glVertex3f(p1.x, p1.y, p1.z); glVertex3f(p2.x, p2.y, p2.z); glVertex3f(apex.x, apex.y, apex.z);
+                        glNormal3f( 0.6f, 0.55f,  0.6f); glVertex3f(p2.x, p2.y, p2.z); glVertex3f(p3.x, p3.y, p3.z); glVertex3f(apex.x, apex.y, apex.z);
+                        glNormal3f(-0.6f, 0.55f,  0.6f); glVertex3f(p3.x, p3.y, p3.z); glVertex3f(p0.x, p0.y, p0.z); glVertex3f(apex.x, apex.y, apex.z);
+                    }
                 }
             }
+            glEnd();
+            glEnable(GL_TEXTURE_2D);
+        }
+        glEndList();
+    }
+
+    // 4D. Orta Mesafe Hafif Agac Silueti (3.4km..5.8km)
+    if (!ck.trees.empty()) {
+        ck.dlMidTrees = glGenLists(1);
+        glNewList(ck.dlMidTrees, GL_COMPILE);
+        glBegin(GL_TRIANGLES);
+        for (const auto& t : ck.trees) {
+            if (t.kind == 2) glColor3f(0.22f, 0.58f, 0.20f);
+            else if (t.kind == 1) glColor3f(0.12f, 0.40f, 0.16f);
+            else glColor3f(0.18f, 0.48f, 0.18f);
+            float yB = t.y + t.h * 0.24f, yT = t.y + t.h;
+            glNormal3f(0.0f, 0.7f, 0.7f);
+            glVertex3f(t.x - t.r, yB, t.z); glVertex3f(t.x + t.r, yB, t.z); glVertex3f(t.x, yT, t.z);
+            glNormal3f(0.7f, 0.7f, 0.0f);
+            glVertex3f(t.x, yB, t.z - t.r); glVertex3f(t.x, yB, t.z + t.r); glVertex3f(t.x, yT, t.z);
         }
         glEnd();
-        glEnable(GL_TEXTURE_2D);
+        glEndList();
     }
-    glEndList();
+
+    // 4E. Uzak Ufuk Skyline LOD (7.6km..14.5km: yuksek kuleler, rezidanslar ve camiler)
+    if (hasSkyline) {
+        ck.dlSkylineLod = glGenLists(1);
+        glNewList(ck.dlSkylineLod, GL_COMPILE);
+        glBegin(GL_QUADS);
+        for (const auto& b : ck.bldgs) {
+            if (b.h < 9.0f && b.type != BLDG_TOWER_GLASS && b.type != BLDG_MAVISEHIR_RES && b.type != BLDG_MOSQUE) continue;
+            if (b.type == BLDG_TOWER_GLASS) glColor3f(0.54f, 0.70f, 0.86f);
+            else if (b.type == BLDG_MAVISEHIR_RES) glColor3f(0.84f, 0.86f, 0.90f);
+            else glColor3f(0.86f, 0.84f, 0.80f);
+            emitBoxFaces(b.x, b.y, b.z, b.w, b.d, b.h, b.cosY, b.sinY, 0.04f, 0.04f, true);
+        }
+        glEnd();
+        glEndList();
+    }
+
+    // 4F. Gece Parlayan Pencere Isiklari Katmani (TEX_NIGHT_WINDOWS ile GL_ONE toplamsal)
+    if (hasNight) {
+        ck.dlNightWindows = glGenLists(1);
+        glNewList(ck.dlNightWindows, GL_COMPILE);
+        glBegin(GL_QUADS);
+        for (const auto& b : ck.bldgs) {
+            if (b.h < 5.5f || b.type == BLDG_MOSQUE || b.type == BLDG_GREENHOUSE) continue;
+            if (b.type == BLDG_TOWER_GLASS) {
+                glColor3f(0.76f, 0.90f, 1.00f);
+            } else if (b.type == BLDG_MAVISEHIR_RES) {
+                glColor3f(1.00f, 0.88f, 0.66f);
+            } else if (b.type == BLDG_FACTORY) {
+                if ((b.colorVar & 3) != 0) continue;
+                glColor3f(0.55f, 0.65f, 0.78f);
+            } else if (b.type == BLDG_HISTORIC_KEMERALTI) {
+                glColor3f(1.00f, 0.76f, 0.42f);
+            } else {
+                int cv = b.colorVar & 3;
+                if (cv == 0) glColor3f(1.00f, 0.84f, 0.56f);
+                else if (cv == 1) glColor3f(0.95f, 0.78f, 0.48f);
+                else if (cv == 2) glColor3f(0.90f, 0.92f, 1.00f);
+                else glColor3f(1.00f, 0.88f, 0.62f);
+            }
+            emitBoxFaces(b.x, b.y, b.z, b.w + 0.16f, b.d + 0.16f, b.h - 0.1f, b.cosY, b.sinY, 0.052f, 0.044f, false);
+        }
+        glEnd();
+        glEndList();
+    }
 }
 
 static void buildGisTerrainTexture() {
     if (!g_hasGisGrid) return;
     std::vector<unsigned char> rgb(MASK_N * MASK_N * 3);
+    const Vec3 sunHill = norm(Vec3(-0.50f, 0.72f, 0.45f));
     parallelFor(MASK_N, [&](int z0, int z1) {
         for (int iz = z0; iz < z1; iz++) {
             for (int ix = 0; ix < MASK_N; ix++) {
@@ -3451,54 +3903,55 @@ static void buildGisTerrainTexture() {
                 float slope = 1.0f - clampf(n.y, 0.0f, 1.0f);
                 float altT = clampf((y - 160.0f) / 620.0f, 0.0f, 1.0f);
                 float rockT = clampf(slope * 2.4f + altT * 0.55f, 0.0f, 1.0f);
+                float hill = clampf(0.74f + 0.46f * dot(n, sunHill), 0.54f, 1.18f);
 
                 float n1 = fbm2(wx * 0.0018f + 1.3f, wz * 0.0018f + 4.7f, 3);
                 float n2 = fbm2(wx * 0.0110f - 2.1f, wz * 0.0110f + 0.9f, 2);
-                float detail = n1 * 12.0f + n2 * 9.0f;
+                float detail = n1 * 14.0f + n2 * 11.0f;
 
                 float r = 100.0f, g = 115.0f, b = 75.0f;
                 if (lc == LC_SEA) {
-                    r = 68.0f; g = 128.0f; b = 138.0f;
+                    r = 44.0f; g = 112.0f; b = 132.0f;
+                    hill = 1.0f;
                 } else if (lc == LC_SALT_WETLAND) {
                     float s1 = clampf(0.5f + 0.7f * n1, 0.0f, 1.0f);
                     float s2 = clampf(0.5f + 0.7f * n2, 0.0f, 1.0f);
-                    // Tuz tavasi kristal -> Pembe Dunaliella tuzu -> Sig turkuaz buharlasma havuzu
-                    r = lerpf(lerpf(178.0f, 224.0f, s1), 98.0f, s2 * 0.55f) + detail * 0.4f;
-                    g = lerpf(lerpf(164.0f, 204.0f, s1), 152.0f, s2 * 0.55f) + detail * 0.4f;
-                    b = lerpf(lerpf(142.0f, 208.0f, s1), 162.0f, s2 * 0.55f) + detail * 0.4f;
+                    r = lerpf(lerpf(182.0f, 228.0f, s1), 94.0f, s2 * 0.55f) + detail * 0.4f;
+                    g = lerpf(lerpf(166.0f, 206.0f, s1), 156.0f, s2 * 0.55f) + detail * 0.4f;
+                    b = lerpf(lerpf(142.0f, 210.0f, s1), 168.0f, s2 * 0.55f) + detail * 0.4f;
                 } else if (lc == LC_WATER) {
-                    r = 46.0f; g = 112.0f; b = 140.0f;
+                    r = 42.0f; g = 112.0f; b = 144.0f;
+                    hill = 1.0f;
                 } else if (lc == LC_URBAN) {
-                    r = 120.0f + detail * 0.55f;
-                    g = 122.0f + detail * 0.55f;
-                    b = 124.0f + detail * 0.55f;
+                    float blockTex = std::sin(wx * 0.14f) * std::sin(wz * 0.14f) * 6.0f;
+                    r = (118.0f + detail * 0.55f + blockTex) * hill;
+                    g = (120.0f + detail * 0.55f + blockTex) * hill;
+                    b = (124.0f + detail * 0.55f + blockTex) * hill;
                 } else if (lc == LC_INDUSTRIAL) {
-                    r = 140.0f + detail * 0.50f;
-                    g = 143.0f + detail * 0.50f;
-                    b = 148.0f + detail * 0.50f;
+                    r = (138.0f + detail * 0.50f) * hill;
+                    g = (142.0f + detail * 0.50f) * hill;
+                    b = (148.0f + detail * 0.50f) * hill;
                 } else if (lc == LC_PARK) {
-                    r = 72.0f + detail;
-                    g = 148.0f + detail * 1.15f;
-                    b = 64.0f + detail * 0.6f;
+                    r = (68.0f + detail) * hill;
+                    g = (150.0f + detail * 1.15f) * hill;
+                    b = (60.0f + detail * 0.6f) * hill;
                 } else if (lc == LC_FOREST) {
-                    r = lerpf(48.0f, 152.0f, rockT * 0.75f) + detail * 0.8f;
-                    g = lerpf(94.0f, 146.0f, rockT * 0.75f) + detail * 0.9f;
-                    b = lerpf(44.0f, 128.0f, rockT * 0.75f) + detail * 0.6f;
+                    r = (lerpf(44.0f, 154.0f, rockT * 0.75f) + detail * 0.8f) * hill;
+                    g = (lerpf(92.0f, 148.0f, rockT * 0.75f) + detail * 0.9f) * hill;
+                    b = (lerpf(40.0f, 128.0f, rockT * 0.75f) + detail * 0.6f) * hill;
                 } else if (lc == LC_CROP) {
                     float fA = clampf(0.5f + 0.65f * n1, 0.0f, 1.0f);
                     float fB = clampf(0.5f + 0.65f * n2, 0.0f, 1.0f);
-                    float furrow = std::sin(wx * 0.09f + wz * 0.06f) * 6.0f;
-                    // Gediz ve Menemen ovasinda dogal surulmus tarla, zeytinlik ve basak gecisleri
-                    r = lerpf(lerpf(136.0f, 164.0f, fA), 102.0f, fB * 0.58f) + detail * 0.5f + furrow;
-                    g = lerpf(lerpf(118.0f, 148.0f, fA), 132.0f, fB * 0.58f) + detail * 0.6f + furrow * 0.8f;
-                    b = lerpf(lerpf(80.0f,  96.0f,  fA), 68.0f,  fB * 0.58f) + detail * 0.4f + furrow * 0.5f;
+                    float furrow = std::sin(wx * 0.09f + wz * 0.06f) * 7.0f;
+                    r = (lerpf(lerpf(134.0f, 166.0f, fA), 98.0f, fB * 0.58f) + detail * 0.5f + furrow) * hill;
+                    g = (lerpf(lerpf(116.0f, 148.0f, fA), 134.0f, fB * 0.58f) + detail * 0.6f + furrow * 0.8f) * hill;
+                    b = (lerpf(lerpf(76.0f,  94.0f,  fA), 66.0f,  fB * 0.58f) + detail * 0.4f + furrow * 0.5f) * hill;
                 } else if (lc == LC_BARREN) {
-                    r = 172.0f + detail; g = 164.0f + detail; b = 144.0f + detail;
+                    r = (174.0f + detail) * hill; g = (164.0f + detail) * hill; b = (142.0f + detail) * hill;
                 } else {
-                    // LC_SHRUB: Ege makisi -> kalker kayalik yamac
-                    r = lerpf(104.0f, 168.0f, rockT) + detail;
-                    g = lerpf(124.0f, 160.0f, rockT) + detail;
-                    b = lerpf(72.0f,  140.0f, rockT) + detail * 0.8f;
+                    r = (lerpf(100.0f, 170.0f, rockT) + detail) * hill;
+                    g = (lerpf(124.0f, 162.0f, rockT) + detail) * hill;
+                    b = (lerpf(68.0f,  140.0f, rockT) + detail * 0.8f) * hill;
                 }
 
                 int idx = (iz * MASK_N + ix) * 3;
@@ -3522,110 +3975,193 @@ static void buildGisTerrainTexture() {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-// Arazi (Land) Mesh Display List - Overture 2048x2048 GIS doku + 1024x1024 DEM veya sentetik yedek
+// Arazi (Land) 8x8 Spatial Tile Display List'leri + Dis Ufuk Ovasi/Deniz Etegi
 static void buildTerrainDisplayList() {
     if (g_hasGisGrid) {
         buildGisTerrainTexture();
     }
-    g_dlTerrain = glGenLists(1);
-    glNewList(g_dlTerrain, GL_COMPILE);
+    const int step = g_hasGisGrid ? 2 : 4;
+    const int alignMask = ~(step - 1);
+    const float invN = 1.0f / (float)MASK_N;
 
-    glEnable(GL_TEXTURE_2D);
-    if (g_hasGisGrid) {
-        glBindTexture(GL_TEXTURE_2D, g_tex[TEX_GIS_MAP]);
-        const int step = 2; // 1024x1024 DEM uyumlu yuksek cozunurluklu arazi agi
-        const float invN = 1.0f / (float)MASK_N;
-        for (int iz = 0; iz < MASK_N - step; iz += step) {
-            glBegin(GL_TRIANGLE_STRIP);
-            for (int ix = 0; ix < MASK_N; ix += step) {
-                for (int dz = 0; dz <= step; dz += step) {
-                    int jz = std::min(MASK_N - 1, iz + dz);
-                    float wx, wz;
-                    gridToWorld(ix, jz, wx, wz);
-                    const WorldMaskCell& mc = maskCellAt(ix, jz);
-                    float y = (mc.signedSeaDist < 0.0f) ? -3.5f : mc.elev;
-                    Vec3 n = sampleTerrainNormal(wx, wz);
-                    glNormal3f(n.x, n.y, n.z);
-                    glColor3f(1.0f, 1.0f, 1.0f);
-                    glTexCoord2f(((float)ix + 0.5f) * invN, ((float)jz + 0.5f) * invN);
-                    glVertex3f(wx, y, wz);
-                }
-            }
-            glEnd();
-        }
-    } else {
-        glBindTexture(GL_TEXTURE_2D, g_tex[TEX_GRASS]);
-        const int step = 4;
-        for (int iz = 0; iz < MASK_N - step; iz += step) {
-            glBegin(GL_TRIANGLE_STRIP);
-            for (int ix = 0; ix < MASK_N; ix += step) {
-                for (int dz = 0; dz <= step; dz += step) {
-                    int jz = std::min(MASK_N - 1, iz + dz);
-                    float wx, wz;
-                    gridToWorld(ix, jz, wx, wz);
-                    const WorldMaskCell& mc = maskCellAt(ix, jz);
-                    float y = (mc.signedSeaDist < 0.0f) ? -3.5f : mc.elev;
-                    Vec3 n = sampleTerrainNormal(wx, wz);
-                    glNormal3f(n.x, n.y, n.z);
-
-                    float slope = 1.0f - clampf(n.y, 0.0f, 1.0f);
-                    float altT = clampf((y - 75.0f) / 600.0f, 0.0f, 1.0f);
-                    float rockT = clampf(slope * 2.8f + altT * 0.70f, 0.0f, 1.0f);
-                    float uT = clampf(mc.urbanBlend * (1.0f - rockT * 0.85f), 0.0f, 0.88f);
-
-                    float natR = lerpf(0.72f, 1.55f, rockT);
-                    float natG = lerpf(0.98f, 1.45f, rockT);
-                    float natB = lerpf(0.60f, 1.30f, rockT);
-
-                    if (wx < -11800.0f && wz < -4200.0f && y < 7.0f) {
-                        natR = 1.24f; natG = 1.18f; natB = 0.88f;
-                    } else if (y < 22.0f && wx < -2500.0f) {
-                        natR = 1.15f; natG = 1.12f; natB = 0.68f;
+    for (int tz = 0; tz < WORLD_TILE_N; tz++) {
+        int iz0 = ((tz * (MASK_N - step)) / WORLD_TILE_N) & alignMask;
+        int iz1 = (tz + 1 == WORLD_TILE_N) ? (MASK_N - step) : (((tz + 1) * (MASK_N - step)) / WORLD_TILE_N) & alignMask;
+        for (int tx = 0; tx < WORLD_TILE_N; tx++) {
+            int ix0 = ((tx * (MASK_N - step)) / WORLD_TILE_N) & alignMask;
+            int ix1 = (tx + 1 == WORLD_TILE_N) ? (MASK_N - step) : (((tx + 1) * (MASK_N - step)) / WORLD_TILE_N) & alignMask;
+            int tidx = tz * WORLD_TILE_N + tx;
+            g_dlTerrainTile[tidx] = glGenLists(1);
+            glNewList(g_dlTerrainTile[tidx], GL_COMPILE);
+            glEnable(GL_TEXTURE_2D);
+            if (g_hasGisGrid) {
+                glBindTexture(GL_TEXTURE_2D, g_tex[TEX_GIS_MAP]);
+                for (int iz = iz0; iz < iz1; iz += step) {
+                    glBegin(GL_TRIANGLE_STRIP);
+                    for (int ix = ix0; ix <= ix1; ix += step) {
+                        for (int dz = 0; dz <= step; dz += step) {
+                            int jz = std::min(MASK_N - 1, iz + dz);
+                            float wx, wz;
+                            gridToWorld(ix, jz, wx, wz);
+                            const WorldMaskCell& mc = maskCellAt(ix, jz);
+                            float y = terrainRenderElevCell(mc);
+                            Vec3 n = sampleTerrainNormal(wx, wz);
+                            glNormal3f(n.x, n.y, n.z);
+                            glColor3f(1.0f, 1.0f, 1.0f);
+                            glTexCoord2f(((float)ix + 0.5f) * invN, ((float)jz + 0.5f) * invN);
+                            glVertex3f(wx, y, wz);
+                        }
                     }
-
-                    float r = lerpf(natR, 0.38f, uT);
-                    float g = lerpf(natG, 0.40f, uT);
-                    float b = lerpf(natB, 0.44f, uT);
-                    glColor3f(r, g, b);
-                    glTexCoord2f(wx * 0.0020f, wz * 0.0020f);
-                    glVertex3f(wx, y, wz);
+                    glEnd();
+                }
+            } else {
+                glBindTexture(GL_TEXTURE_2D, g_tex[TEX_GRASS]);
+                for (int iz = iz0; iz < iz1; iz += step) {
+                    glBegin(GL_TRIANGLE_STRIP);
+                    for (int ix = ix0; ix <= ix1; ix += step) {
+                        for (int dz = 0; dz <= step; dz += step) {
+                            int jz = std::min(MASK_N - 1, iz + dz);
+                            float wx, wz;
+                            gridToWorld(ix, jz, wx, wz);
+                            const WorldMaskCell& mc = maskCellAt(ix, jz);
+                            float y = terrainRenderElevCell(mc);
+                            Vec3 n = sampleTerrainNormal(wx, wz);
+                            glNormal3f(n.x, n.y, n.z);
+                            float slope = 1.0f - clampf(n.y, 0.0f, 1.0f);
+                            float altT = clampf((y - 75.0f) / 600.0f, 0.0f, 1.0f);
+                            float rockT = clampf(slope * 2.8f + altT * 0.70f, 0.0f, 1.0f);
+                            float uT = clampf(mc.urbanBlend * (1.0f - rockT * 0.85f), 0.0f, 0.88f);
+                            float natR = lerpf(0.72f, 1.55f, rockT);
+                            float natG = lerpf(0.98f, 1.45f, rockT);
+                            float natB = lerpf(0.60f, 1.30f, rockT);
+                            if (wx < -11800.0f && wz < -4200.0f && y < 7.0f) {
+                                natR = 1.24f; natG = 1.18f; natB = 0.88f;
+                            } else if (y < 22.0f && wx < -2500.0f) {
+                                natR = 1.15f; natG = 1.12f; natB = 0.68f;
+                            }
+                            glColor3f(lerpf(natR, 0.38f, uT), lerpf(natG, 0.40f, uT), lerpf(natB, 0.44f, uT));
+                            glTexCoord2f(wx * 0.0020f, wz * 0.0020f);
+                            glVertex3f(wx, y, wz);
+                        }
+                    }
+                    glEnd();
                 }
             }
-            glEnd();
+            glEndList();
         }
     }
+
+    // Dunya sinirlari otesinde sis icine eriyen uzak ufuk eteği (haritanin ani kesilmesini onler)
+    g_dlHorizonApron = glGenLists(1);
+    glNewList(g_dlHorizonApron, GL_COMPILE);
+    glDisable(GL_TEXTURE_2D);
+    glNormal3f(0.0f, 1.0f, 0.0f);
+    const float ext = 28000.0f;
+    const float yAp = -0.35f;
+    glBegin(GL_QUADS);
+    // Bati seridi (Sasali / Ege denizi ufku)
+    glColor3f(0.28f, 0.40f, 0.36f);
+    glVertex3f(WORLD_X0 - ext, yAp, WORLD_Z0 - ext); glVertex3f(WORLD_X0, yAp, WORLD_Z0 - ext);
+    glVertex3f(WORLD_X0, yAp, WORLD_Z1 + ext);       glVertex3f(WORLD_X0 - ext, yAp, WORLD_Z1 + ext);
+    // Dogu seridi
+    glColor3f(0.38f, 0.44f, 0.30f);
+    glVertex3f(WORLD_X1, yAp, WORLD_Z0 - ext);       glVertex3f(WORLD_X1 + ext, yAp, WORLD_Z0 - ext);
+    glVertex3f(WORLD_X1 + ext, yAp, WORLD_Z1 + ext); glVertex3f(WORLD_X1, yAp, WORLD_Z1 + ext);
+    // Kuzey seridi
+    glVertex3f(WORLD_X0, yAp, WORLD_Z0 - ext); glVertex3f(WORLD_X1, yAp, WORLD_Z0 - ext);
+    glVertex3f(WORLD_X1, yAp, WORLD_Z0);       glVertex3f(WORLD_X0, yAp, WORLD_Z0);
+    // Guney seridi
+    glVertex3f(WORLD_X0, yAp, WORLD_Z1);       glVertex3f(WORLD_X1, yAp, WORLD_Z1);
+    glVertex3f(WORLD_X1, yAp, WORLD_Z1 + ext); glVertex3f(WORLD_X0, yAp, WORLD_Z1 + ext);
+    glEnd();
     glEndList();
 }
 
-// Izmir Korfezi Canli Deniz Display List (Y = 0.0m)
+// Izmir Korfezi Canli Deniz 8x8 Tile Display List'leri (Y = 0.0m)
 static void buildSeaDisplayList() {
-    g_dlSea = glGenLists(1);
-    glNewList(g_dlSea, GL_COMPILE);
-
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_tex[TEX_WATER]);
-    glNormal3f(0.0f, 1.0f, 0.0f);
-    const int seaStep = g_hasGisGrid ? 4 : 6;
-    for (int iz = 0; iz < MASK_N - seaStep; iz += seaStep) {
-        glBegin(GL_TRIANGLE_STRIP);
-        for (int ix = 0; ix < MASK_N; ix += seaStep) {
-            for (int dz = 0; dz <= seaStep; dz += seaStep) {
-                int jz = std::min(MASK_N - 1, iz + dz);
-                float wx, wz;
-                gridToWorld(ix, jz, wx, wz);
-                const WorldMaskCell& mc = maskCellAt(ix, jz);
-                float depthFactor = clampf(-mc.signedSeaDist / 550.0f, 0.0f, 1.0f);
-                float r = lerpf(0.12f, 0.04f, depthFactor);
-                float g = lerpf(0.58f, 0.24f, depthFactor);
-                float b = lerpf(0.74f, 0.52f, depthFactor);
-                glColor3f(r, g, b);
-                glTexCoord2f(wx * 0.0010f, wz * 0.0010f);
-                glVertex3f(wx, 0.0f, wz);
+    const int seaStep = g_hasGisGrid ? 2 : 4;
+    const int alignMask = ~(seaStep - 1);
+    for (int tz = 0; tz < WORLD_TILE_N; tz++) {
+        int iz0 = ((tz * (MASK_N - seaStep)) / WORLD_TILE_N) & alignMask;
+        int iz1 = (tz + 1 == WORLD_TILE_N) ? (MASK_N - seaStep) : (((tz + 1) * (MASK_N - seaStep)) / WORLD_TILE_N) & alignMask;
+        for (int tx = 0; tx < WORLD_TILE_N; tx++) {
+            int ix0 = ((tx * (MASK_N - seaStep)) / WORLD_TILE_N) & alignMask;
+            int ix1 = (tx + 1 == WORLD_TILE_N) ? (MASK_N - seaStep) : (((tx + 1) * (MASK_N - seaStep)) / WORLD_TILE_N) & alignMask;
+            int tidx = tz * WORLD_TILE_N + tx;
+            bool hasSea = false;
+            if (g_hasGisGrid) {
+                for (int iz = iz0; iz < iz1 && !hasSea; iz += seaStep) {
+                    for (int ix = ix0; ix < ix1; ix += seaStep) {
+                        if (maskCellAt(ix, iz).signedSeaDist <= 4.0f ||
+                            maskCellAt(ix + seaStep, iz).signedSeaDist <= 4.0f ||
+                            maskCellAt(ix, iz + seaStep).signedSeaDist <= 4.0f ||
+                            maskCellAt(ix + seaStep, iz + seaStep).signedSeaDist <= 4.0f) {
+                            hasSea = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                hasSea = true;
             }
+            if (!hasSea) {
+                g_dlSeaTile[tidx] = 0;
+                continue;
+            }
+            g_dlSeaTile[tidx] = glGenLists(1);
+            glNewList(g_dlSeaTile[tidx], GL_COMPILE);
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, g_tex[TEX_WATER]);
+            glNormal3f(0.0f, 1.0f, 0.0f);
+            for (int iz = iz0; iz < iz1; iz += seaStep) {
+                if (g_hasGisGrid) {
+                    glBegin(GL_QUADS);
+                    for (int ix = ix0; ix < ix1; ix += seaStep) {
+                        const WorldMaskCell& c00 = maskCellAt(ix, iz);
+                        const WorldMaskCell& c01 = maskCellAt(ix, iz + seaStep);
+                        const WorldMaskCell& c11 = maskCellAt(ix + seaStep, iz + seaStep);
+                        const WorldMaskCell& c10 = maskCellAt(ix + seaStep, iz);
+                        if (c00.signedSeaDist > 4.0f && c01.signedSeaDist > 4.0f &&
+                            c11.signedSeaDist > 4.0f && c10.signedSeaDist > 4.0f) {
+                            continue;
+                        }
+                        int xs[4] = {ix, ix, ix + seaStep, ix + seaStep};
+                        int zs[4] = {iz, iz + seaStep, iz + seaStep, iz};
+                        const WorldMaskCell* cs[4] = {&c00, &c01, &c11, &c10};
+                        for (int k = 0; k < 4; k++) {
+                            float wx, wz;
+                            gridToWorld(xs[k], zs[k], wx, wz);
+                            float depthFactor = clampf(-cs[k]->signedSeaDist / 550.0f, 0.0f, 1.0f);
+                            glColor3f(lerpf(0.10f, 0.03f, depthFactor),
+                                      lerpf(0.60f, 0.22f, depthFactor),
+                                      lerpf(0.76f, 0.50f, depthFactor));
+                            glTexCoord2f(wx * 0.0012f, wz * 0.0012f);
+                            glVertex3f(wx, 0.0f, wz);
+                        }
+                    }
+                    glEnd();
+                } else {
+                    glBegin(GL_TRIANGLE_STRIP);
+                    for (int ix = ix0; ix <= ix1; ix += seaStep) {
+                        for (int dz = 0; dz <= seaStep; dz += seaStep) {
+                            int jz = std::min(MASK_N - 1, iz + dz);
+                            float wx, wz;
+                            gridToWorld(ix, jz, wx, wz);
+                            const WorldMaskCell& mc = maskCellAt(ix, jz);
+                            float depthFactor = clampf(-mc.signedSeaDist / 550.0f, 0.0f, 1.0f);
+                            glColor3f(lerpf(0.10f, 0.03f, depthFactor),
+                                      lerpf(0.60f, 0.22f, depthFactor),
+                                      lerpf(0.76f, 0.50f, depthFactor));
+                            glTexCoord2f(wx * 0.0012f, wz * 0.0012f);
+                            glVertex3f(wx, 0.0f, wz);
+                        }
+                    }
+                    glEnd();
+                }
+            }
+            glEndList();
         }
-        glEnd();
     }
-    glEndList();
 }
 
 static void buildTerrainAndSeaDisplayList() {
@@ -3699,17 +4235,26 @@ static void buildQuayAndPromenadeDisplayList() {
         glDisable(GL_POLYGON_OFFSET_FILL);
     }
 
+    g_nightStreetLights.clear();
+    for (int i = 0; i < n; i += 2) {
+        Vec2 lp = g_coastSpline[i] + g_coastInNormals[i] * 5.0f;
+        float ly = std::max(2.6f, sampleTerrainElev(lp.x, lp.z)) + 4.8f;
+        g_nightStreetLights.emplace_back(lp.x, ly, lp.z);
+    }
+
     // 4. 7 Gercek IZDENIZ Vapur Iskelesi (Konak, Pasaport, Alsancak, Karsiyaka, Bostanli, Goztepe, Uckuyular)
     glBindTexture(GL_TEXTURE_2D, g_tex[TEX_CONCRETE]);
     for (int p = 0; p < NUM_PIERS; p++) {
         Vec2 target = geoPt(PIERS[p].lat, PIERS[p].lon);
         Vec2 base, seaDir, tang;
         if (g_hasGisGrid) {
+            Vec2 shoreBase = g_pierShorePos[p];
             Vec2 seaApproach = g_pierSeaPos[p];
-            seaDir = norm2(seaApproach - target);
+            seaDir = norm2(seaApproach - shoreBase);
+            if (len2(seaDir) < 0.1f) seaDir = norm2(seaApproach - target);
             if (len2(seaDir) < 0.1f) seaDir = Vec2(-1.0f, 0.0f);
             tang = Vec2(-seaDir.z, seaDir.x);
-            base = seaApproach - seaDir * 72.0f;
+            base = shoreBase + seaDir * 2.0f;
         } else {
             int bestI = 0;
             float bestD = 1e18f;
@@ -3717,168 +4262,270 @@ static void buildQuayAndPromenadeDisplayList() {
                 float d = len2(g_coastSpline[i] - target);
                 if (d < bestD) { bestD = d; bestI = i; }
             }
-            base = g_coastSpline[bestI];
+            base = g_coastSpline[bestI] - g_coastInNormals[bestI] * -4.0f;
             seaDir = g_coastInNormals[bestI] * -1.0f;
             tang = g_coastTangents[bestI];
-            g_pierSeaPos[p] = base + seaDir * 92.0f;
+            g_pierSeaPos[p] = base + seaDir * 96.0f;
         }
-        Vec2 tip = base + seaDir * 68.0f;
+        Vec2 tip = base + seaDir * 94.0f;
+        Vec2 pierMid = (base + tip) * 0.5f;
+        float deckY = std::max(2.25f, sampleTerrainElev(base.x, base.z) + 0.25f);
 
-        glColor3f(0.88f, 0.87f, 0.84f);
         glBegin(GL_QUADS);
-        // Iskele platformu
-        Vec2 c0 = base - tang * 14.0f, c1 = base + tang * 14.0f;
-        Vec2 c2 = tip + tang * 14.0f,  c3 = tip - tang * 14.0f;
-        glNormal3f(0, 1, 0);
-        glTexCoord2f(0, 0); glVertex3f(c0.x, 2.35f, c0.z);
-        glTexCoord2f(1, 0); glVertex3f(c1.x, 2.35f, c1.z);
-        glTexCoord2f(1, 2); glVertex3f(c2.x, 2.35f, c2.z);
-        glTexCoord2f(0, 2); glVertex3f(c3.x, 2.35f, c3.z);
-        // Iskele binasi
-        Vec2 mid = base + seaDir * 24.0f;
-        glColor3f(0.92f, 0.94f, 0.98f);
-        emitBoxFaces(mid.x, 2.35f, mid.z, 22.0f, 28.0f, 6.8f, tang.x, tang.z, 0.08f, 0.1f);
+        // Solid anchored concrete/stone pier platform down below water level (-1.2m..deckY)
+        glColor3f(0.62f, 0.63f, 0.64f);
+        emitBoxFaces(pierMid.x, -1.2f, pierMid.z, 16.0f, 94.0f, deckY + 1.2f, tang.x, tang.z, 0.05f, 0.05f);
+        // Iskele binasi + cam bekleme salonu + lacivert cati kanopisi
+        Vec2 mid = base + seaDir * 48.0f;
+        glColor3f(0.84f, 0.86f, 0.89f);
+        emitBoxFaces(mid.x, deckY, mid.z, 13.0f, 20.0f, 4.6f, tang.x, tang.z, 0.08f, 0.1f);
+        glColor3f(0.14f, 0.34f, 0.64f);
+        emitBoxFaces(mid.x, deckY + 4.6f, mid.z, 14.5f, 22.0f, 1.2f, tang.x, tang.z, 0.08f, 0.1f);
         glEnd();
+        g_nightStreetLights.emplace_back(tip.x, deckY + 3.5f, tip.z);
 
         float yaw = std::atan2(seaDir.x, seaDir.z);
-        drawTextWorld(Vec3(mid.x, 11.5f, mid.z), yaw, 0.35f, PIERS[p].name, 0.95f, 0.98f, 1.0f);
+        drawTextWorld(Vec3(mid.x, deckY + 9.2f, mid.z), yaw, 0.35f, PIERS[p].name, 0.95f, 0.98f, 1.0f);
     }
 
     glEndList();
 }
 
 // 28 Istasyonlu Cift Hatli IZBAN + Otoyol Aglari Display List
+static void computeV2PolyElevs(const std::vector<Vec2>& pts, bool isBridge, int level,
+                               float baseOff, float halfW, std::vector<float>& ys) {
+    size_t m = pts.size();
+    ys.resize(m);
+    if (m == 0) return;
+    float sampleHW = std::max(2.0f, halfW + 0.5f);
+    auto groundMaxAt = [&](size_t i) -> float {
+        Vec2 p = pts[i];
+        Vec2 d(0.0f, 0.0f);
+        if (m >= 2) {
+            if (i == 0) d = pts[1] - pts[0];
+            else if (i + 1 == m) d = pts[m - 1] - pts[m - 2];
+            else d = pts[i + 1] - pts[i - 1];
+        }
+        float l = len2(d);
+        float eC = sampleRenderedTerrainMaxElev(p.x, p.z);
+        if (l < 1e-4f) return eC;
+        Vec2 n(-d.z / l, d.x / l);
+        float eL = sampleRenderedTerrainMaxElev(p.x - n.x * sampleHW, p.z - n.z * sampleHW);
+        float eR = sampleRenderedTerrainMaxElev(p.x + n.x * sampleHW, p.z + n.z * sampleHW);
+        return std::max(eC, std::max(eL, eR));
+    };
+    if (!isBridge) {
+        float lvlOff = (level > 0) ? (0.44f + 3.2f * level) : baseOff;
+        for (size_t i = 0; i < m; i++) {
+            ys[i] = groundMaxAt(i) + lvlOff;
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            for (size_t i = 1; i + 1 < m; i++) {
+                ys[i] = std::max(ys[i], 0.5f * (ys[i - 1] + ys[i + 1]) - 0.10f);
+            }
+        }
+        return;
+    }
+    float y0 = groundMaxAt(0) + 0.42f;
+    float y1 = groundMaxAt(m - 1) + 0.42f;
+    float arch = (level > 0) ? 6.2f : 1.8f;
+    for (size_t i = 0; i < m; i++) {
+        float t = (m > 1) ? ((float)i / (float)(m - 1)) : 0.0f;
+        float yc = lerpf(y0, y1, t) + std::sin(t * PI_F) * arch;
+        float te = groundMaxAt(i) + 0.52f;
+        ys[i] = std::max(yc, te);
+    }
+}
+
+static void ensureV2MajorRoadElevs() {
+    for (auto& rp : g_v2MajorRoads) {
+        if (rp.pts.size() >= 2 && rp.ys.size() != rp.pts.size()) {
+            computeV2PolyElevs(rp.pts, rp.isBridge != 0, rp.level, 0.38f, rp.halfW, rp.ys);
+        }
+    }
+}
+
 static void buildIzbanAndRoadsDisplayList() {
-    g_dlIzbanAndRoads = glGenLists(1);
-    glNewList(g_dlIzbanAndRoads, GL_COMPILE);
-
-    glEnable(GL_POLYGON_OFFSET_FILL);
-    glPolygonOffset(-1.5f, -1.5f);
-
     if (g_hasV2Roads) {
-        auto computePolyElevs = [](const std::vector<Vec2>& pts, bool isBridge, int level, float baseOff, std::vector<float>& ys) {
-            size_t m = pts.size();
-            ys.resize(m);
-            if (!isBridge) {
-                float lvlOff = (level > 0) ? (0.40f + 3.2f * level) : baseOff;
-                for (size_t i = 0; i < m; i++) {
-                    ys[i] = sampleTerrainElev(pts[i].x, pts[i].z) + lvlOff;
-                }
-                return;
-            }
-            float y0 = sampleTerrainElev(pts[0].x, pts[0].z) + 0.35f;
-            float y1 = sampleTerrainElev(pts[m - 1].x, pts[m - 1].z) + 0.35f;
-            float arch = (level > 0) ? 6.2f : 1.8f;
-            for (size_t i = 0; i < m; i++) {
-                float t = (m > 1) ? ((float)i / (float)(m - 1)) : 0.0f;
-                float yc = lerpf(y0, y1, t) + std::sin(t * PI_F) * arch;
-                float te = sampleTerrainElev(pts[i].x, pts[i].z) + 0.45f;
-                ys[i] = std::max(yc, te);
-            }
-        };
+        ensureV2MajorRoadElevs();
 
-        // 1A. Viyaduk ve Kopru Beton Ayaklari + Kenar Parapetleri
-        glDisable(GL_TEXTURE_2D);
-        glBegin(GL_QUADS);
-        for (const auto& rp : g_v2MajorRoads) {
-            if (!rp.isBridge || rp.pts.size() < 2) continue;
-            std::vector<float> ys;
-            computePolyElevs(rp.pts, true, rp.level, 0.25f, ys);
-            float hw = rp.halfW + 0.8f;
-            for (size_t i = 0; i + 1 < rp.pts.size(); i++) {
-                Vec2 d = rp.pts[i + 1] - rp.pts[i];
-                float l = len2(d);
-                if (l < 0.5f) continue;
-                Vec2 n(-d.z / l, d.x / l);
-                Vec2 p0 = rp.pts[i], p1 = rp.pts[i + 1];
-                float yA = ys[i], yB = ys[i + 1];
-                // Kopru yan kirisi
-                glColor3f(0.76f, 0.77f, 0.79f);
-                for (int s = -1; s <= 1; s += 2) {
-                    Vec2 eA = p0 + n * (s * hw), eB = p1 + n * (s * hw);
-                    glNormal3f(n.x * s, 0.0f, n.z * s);
-                    glVertex3f(eA.x, yA - 1.6f, eA.z);
-                    glVertex3f(eB.x, yB - 1.6f, eB.z);
-                    glVertex3f(eB.x, yB + 0.65f, eB.z);
-                    glVertex3f(eA.x, yA + 0.65f, eA.z);
+        // 1. V2 Ana Yollari 8x8 spatial tile'lara dagit (culling ile yuksek FPS) + gece sokak lambalari topla
+        std::vector<std::vector<size_t>> tileRoadIdx(NUM_WORLD_TILES);
+        const float tileW = (WORLD_X1 - WORLD_X0) / (float)WORLD_TILE_N;
+        const float tileH = (WORLD_Z1 - WORLD_Z0) / (float)WORLD_TILE_N;
+        for (size_t ri = 0; ri < g_v2MajorRoads.size(); ri++) {
+            const auto& rp = g_v2MajorRoads[ri];
+            if (rp.pts.size() < 2 || rp.ys.size() != rp.pts.size()) continue;
+            Vec2 mid = rp.pts[rp.pts.size() / 2];
+            int tx = clampi((int)((mid.x - WORLD_X0) / tileW), 0, WORLD_TILE_N - 1);
+            int tz = clampi((int)((mid.z - WORLD_Z0) / tileH), 0, WORLD_TILE_N - 1);
+            int tidx = tz * WORLD_TILE_N + tx;
+            tileRoadIdx[tidx].push_back(ri);
+            float tcx = WORLD_X0 + (tx + 0.5f) * tileW;
+            float tcz = WORLD_Z0 + (tz + 0.5f) * tileH;
+            for (const auto& p : rp.pts) {
+                float d = std::sqrt((p.x - tcx) * (p.x - tcx) + (p.z - tcz) * (p.z - tcz));
+                if (d + rp.halfW > g_roadTileRadius[tidx]) g_roadTileRadius[tidx] = d + rp.halfW;
+            }
+            if (rp.tier <= 1) {
+                for (size_t k = 0; k < rp.pts.size(); k += 3) {
+                    g_nightStreetLights.emplace_back(rp.pts[k].x, rp.ys[k] + 4.5f, rp.pts[k].z);
                 }
-                // Viyaduk kolonu (zemin ile kopru tabliyesi arasi > 2.2m ise)
-                if ((i % 2 == 0)) {
-                    Vec2 mid = (p0 + p1) * 0.5f;
-                    float my = 0.5f * (yA + yB);
-                    float ty = sampleTerrainElev(mid.x, mid.z);
-                    if (my - ty > 2.2f) {
-                        glColor3f(0.70f, 0.71f, 0.73f);
-                        emitBoxFaces(mid.x, ty - 1.0f, mid.z, std::min(3.2f, rp.halfW * 0.65f), 2.4f, (my - ty) + 0.4f, d.x / l, d.z / l, 0.1f, 0.1f, false);
+            }
+        }
+
+        for (int tidx = 0; tidx < NUM_WORLD_TILES; tidx++) {
+            if (tileRoadIdx[tidx].empty()) {
+                g_dlRoadTile[tidx] = 0;
+                continue;
+            }
+            if (g_roadTileRadius[tidx] < 3600.0f) g_roadTileRadius[tidx] = 3600.0f;
+            g_dlRoadTile[tidx] = glGenLists(1);
+            glNewList(g_dlRoadTile[tidx], GL_COMPILE);
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-2.5f, -2.5f);
+
+            // 1A. Viyaduk ve Kopru Beton Ayaklari + Kenar Parapetleri
+            glDisable(GL_TEXTURE_2D);
+            glBegin(GL_QUADS);
+            for (size_t ri : tileRoadIdx[tidx]) {
+                const auto& rp = g_v2MajorRoads[ri];
+                if (!rp.isBridge) continue;
+                const std::vector<float>& ys = rp.ys;
+                float hw = rp.halfW + 0.8f;
+                for (size_t i = 0; i + 1 < rp.pts.size(); i++) {
+                    Vec2 d = rp.pts[i + 1] - rp.pts[i];
+                    float l = len2(d);
+                    if (l < 0.5f) continue;
+                    Vec2 n(-d.z / l, d.x / l);
+                    Vec2 p0 = rp.pts[i], p1 = rp.pts[i + 1];
+                    float yA = ys[i], yB = ys[i + 1];
+                    glColor3f(0.76f, 0.77f, 0.79f);
+                    for (int s = -1; s <= 1; s += 2) {
+                        Vec2 eA = p0 + n * (s * hw), eB = p1 + n * (s * hw);
+                        glNormal3f(n.x * s, 0.0f, n.z * s);
+                        glVertex3f(eA.x, yA - 1.6f, eA.z);
+                        glVertex3f(eB.x, yB - 1.6f, eB.z);
+                        glVertex3f(eB.x, yB + 0.65f, eB.z);
+                        glVertex3f(eA.x, yA + 0.65f, eA.z);
+                    }
+                    if ((i % 3 == 0)) {
+                        Vec2 mid = (p0 + p1) * 0.5f;
+                        float my = 0.5f * (yA + yB);
+                        float ty = sampleTerrainElev(mid.x, mid.z);
+                        if (my - ty > 2.2f) {
+                            glColor3f(0.70f, 0.71f, 0.73f);
+                            emitBoxFaces(mid.x, ty - 1.0f, mid.z, std::min(3.2f, rp.halfW * 0.65f), 2.4f, (my - ty) + 0.4f, d.x / l, d.z / l, 0.1f, 0.1f, false);
+                        }
                     }
                 }
             }
-        }
-        glEnd();
+            glEnd();
 
-        // 1B. Gercek Otoyollar, Cevreyolu, Bulvarlar ve Ana Arterler (Asfalt)
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, g_tex[TEX_ASPHALT]);
-        glBegin(GL_QUADS);
-        for (const auto& rp : g_v2MajorRoads) {
-            if (rp.pts.size() < 2) continue;
-            std::vector<float> ys;
-            computePolyElevs(rp.pts, rp.isBridge != 0, rp.level, 0.24f, ys);
-            if (rp.tier == 0) glColor3f(0.24f, 0.26f, 0.29f);
-            else if (rp.tier == 1) glColor3f(0.32f, 0.34f, 0.38f);
-            else glColor3f(0.42f, 0.44f, 0.48f);
+            // 1B. Gercek Otoyollar, Cevreyolu, Bulvarlar ve Ana Arterler (Asfalt)
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, g_tex[TEX_ASPHALT]);
+            glBegin(GL_QUADS);
+            for (size_t ri : tileRoadIdx[tidx]) {
+                const auto& rp = g_v2MajorRoads[ri];
+                const std::vector<float>& ys = rp.ys;
+                if (rp.tier == 0) glColor3f(0.24f, 0.26f, 0.29f);
+                else if (rp.tier == 1) glColor3f(0.32f, 0.34f, 0.38f);
+                else glColor3f(0.42f, 0.44f, 0.48f);
 
-            for (size_t i = 0; i + 1 < rp.pts.size(); i++) {
-                Vec2 p0 = rp.pts[i], p1 = rp.pts[i + 1];
-                Vec2 d = p1 - p0;
-                float l = len2(d);
-                if (l < 0.5f) continue;
-                Vec2 n(-d.z / l, d.x / l);
-                Vec2 aL = p0 - n * rp.halfW, aR = p0 + n * rp.halfW;
-                Vec2 bL = p1 - n * rp.halfW, bR = p1 + n * rp.halfW;
-                glNormal3f(0.0f, 1.0f, 0.0f);
-                glTexCoord2f(0.0f, 0.0f); glVertex3f(aL.x, ys[i], aL.z);
-                glTexCoord2f(0.0f, l * 0.08f); glVertex3f(bL.x, ys[i + 1], bL.z);
-                glTexCoord2f(1.0f, l * 0.08f); glVertex3f(bR.x, ys[i + 1], bR.z);
-                glTexCoord2f(1.0f, 0.0f); glVertex3f(aR.x, ys[i], aR.z);
+                for (size_t i = 0; i + 1 < rp.pts.size(); i++) {
+                    Vec2 p0 = rp.pts[i], p1 = rp.pts[i + 1];
+                    Vec2 d = p1 - p0;
+                    float l = len2(d);
+                    if (l < 0.5f) continue;
+                    Vec2 n(-d.z / l, d.x / l);
+                    Vec2 aL = p0 - n * rp.halfW, aR = p0 + n * rp.halfW;
+                    Vec2 bL = p1 - n * rp.halfW, bR = p1 + n * rp.halfW;
+                    glNormal3f(0.0f, 1.0f, 0.0f);
+                    glTexCoord2f(0.0f, 0.0f); glVertex3f(aL.x, ys[i], aL.z);
+                    glTexCoord2f(0.0f, l * 0.08f); glVertex3f(bL.x, ys[i + 1], bL.z);
+                    glTexCoord2f(1.0f, l * 0.08f); glVertex3f(bR.x, ys[i + 1], bR.z);
+                    glTexCoord2f(1.0f, 0.0f); glVertex3f(aR.x, ys[i], aR.z);
+                }
             }
-        }
-        glEnd();
+            glEnd();
 
-        // 1C. Otoyol/Bulvar Sari Orta Refuj ve Beyaz Kenar Cizgileri (tier 0 ve 1)
-        glDisable(GL_TEXTURE_2D);
-        glBegin(GL_QUADS);
-        for (const auto& rp : g_v2MajorRoads) {
-            if (rp.tier > 1 || rp.pts.size() < 2) continue;
-            std::vector<float> ys;
-            computePolyElevs(rp.pts, rp.isBridge != 0, rp.level, 0.24f, ys);
-            for (size_t i = 0; i + 1 < rp.pts.size(); i++) {
-                Vec2 p0 = rp.pts[i], p1 = rp.pts[i + 1];
-                Vec2 d = p1 - p0;
-                float l = len2(d);
-                if (l < 1.0f) continue;
-                Vec2 n(-d.z / l, d.x / l);
-                glColor3f(0.95f, 0.82f, 0.22f);
-                glNormal3f(0.0f, 1.0f, 0.0f);
-                glVertex3f(p0.x - n.x * 0.35f, ys[i] + 0.06f, p0.z - n.z * 0.35f);
-                glVertex3f(p1.x - n.x * 0.35f, ys[i + 1] + 0.06f, p1.z - n.z * 0.35f);
-                glVertex3f(p1.x + n.x * 0.35f, ys[i + 1] + 0.06f, p1.z + n.z * 0.35f);
-                glVertex3f(p0.x + n.x * 0.35f, ys[i] + 0.06f, p0.z + n.z * 0.35f);
+            // 1B-2. Yuzey yollari icin beton/toprak dolgu kenar etekleri
+            glDisable(GL_TEXTURE_2D);
+            glColor3f(0.34f, 0.33f, 0.31f);
+            glBegin(GL_QUADS);
+            for (size_t ri : tileRoadIdx[tidx]) {
+                const auto& rp = g_v2MajorRoads[ri];
+                if (rp.isBridge) continue;
+                const std::vector<float>& ys = rp.ys;
+                for (size_t i = 0; i + 1 < rp.pts.size(); i++) {
+                    Vec2 p0 = rp.pts[i], p1 = rp.pts[i + 1];
+                    Vec2 d = p1 - p0;
+                    float l = len2(d);
+                    if (l < 0.5f) continue;
+                    Vec2 n(-d.z / l, d.x / l);
+                    Vec2 aL = p0 - n * rp.halfW, aR = p0 + n * rp.halfW;
+                    Vec2 bL = p1 - n * rp.halfW, bR = p1 + n * rp.halfW;
+                    glNormal3f(-n.x, 0.25f, -n.z);
+                    glVertex3f(aL.x, ys[i], aL.z);
+                    glVertex3f(aL.x, ys[i] - 2.5f, aL.z);
+                    glVertex3f(bL.x, ys[i + 1] - 2.5f, bL.z);
+                    glVertex3f(bL.x, ys[i + 1], bL.z);
+
+                    glNormal3f(n.x, 0.25f, n.z);
+                    glVertex3f(bR.x, ys[i + 1], bR.z);
+                    glVertex3f(bR.x, ys[i + 1] - 2.5f, bR.z);
+                    glVertex3f(aR.x, ys[i] - 2.5f, aR.z);
+                    glVertex3f(aR.x, ys[i], aR.z);
+                }
             }
-        }
-        glEnd();
+            glEnd();
 
-        // 2. Gercek Rayli Sistemler (IZBAN standart hat + Izmir Tramvay + M1 Yuzey Metro; tuneller haric)
+            // 1C. Otoyol/Bulvar Sari Orta Refuj ve Beyaz Kenar Cizgileri (tier 0 ve 1)
+            glBegin(GL_QUADS);
+            for (size_t ri : tileRoadIdx[tidx]) {
+                const auto& rp = g_v2MajorRoads[ri];
+                if (rp.tier > 1) continue;
+                const std::vector<float>& ys = rp.ys;
+                for (size_t i = 0; i + 1 < rp.pts.size(); i++) {
+                    Vec2 p0 = rp.pts[i], p1 = rp.pts[i + 1];
+                    Vec2 d = p1 - p0;
+                    float l = len2(d);
+                    if (l < 1.0f) continue;
+                    Vec2 n(-d.z / l, d.x / l);
+                    glColor3f(0.95f, 0.82f, 0.22f);
+                    glNormal3f(0.0f, 1.0f, 0.0f);
+                    glVertex3f(p0.x - n.x * 0.35f, ys[i] + 0.06f, p0.z - n.z * 0.35f);
+                    glVertex3f(p1.x - n.x * 0.35f, ys[i + 1] + 0.06f, p1.z - n.z * 0.35f);
+                    glVertex3f(p1.x + n.x * 0.35f, ys[i + 1] + 0.06f, p1.z + n.z * 0.35f);
+                    glVertex3f(p0.x + n.x * 0.35f, ys[i] + 0.06f, p0.z + n.z * 0.35f);
+                }
+            }
+            glEnd();
+
+            glDisable(GL_POLYGON_OFFSET_FILL);
+            glEndList();
+        }
+    }
+
+    // 2. Rayli Sistemler + 28 IZBAN Istasyonu (+ sentetik mod yollari)
+    g_dlRails = glGenLists(1);
+    glNewList(g_dlRails, GL_COMPILE);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-2.5f, -2.5f);
+
+    if (g_hasV2Roads) {
+        // Gercek Rayli Sistemler (IZBAN standart hat + Izmir Tramvay + M1 Yuzey Metro; tuneller haric)
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, g_tex[TEX_BALLAST]);
         glBegin(GL_QUADS);
         for (const auto& rs : g_v2Rails) {
             if (rs.pts.size() < 2) continue;
-            std::vector<float> ys;
-            computePolyElevs(rs.pts, rs.isBridge != 0, rs.isBridge ? 1 : 0, 0.25f, ys);
             float hw = (rs.rtype == 0) ? 3.8f : 2.5f;
-            if (rs.rtype == 1) glColor3f(0.45f, 0.62f, 0.42f); // Izmir Yesil Cim Tramvay koridoru
-            else glColor3f(0.74f, 0.72f, 0.69f);               // Kirma tas balast
+            std::vector<float> ys;
+            computeV2PolyElevs(rs.pts, rs.isBridge != 0, rs.isBridge ? 1 : 0, 0.38f, hw, ys);
+            if (rs.rtype == 1) glColor3f(0.45f, 0.62f, 0.42f);
+            else glColor3f(0.74f, 0.72f, 0.69f);
 
             for (size_t i = 0; i + 1 < rs.pts.size(); i++) {
                 Vec2 p0 = rs.pts[i], p1 = rs.pts[i + 1];
@@ -3903,8 +4550,9 @@ static void buildIzbanAndRoadsDisplayList() {
         glBegin(GL_QUADS);
         for (const auto& rs : g_v2Rails) {
             if (rs.pts.size() < 2) continue;
+            float hw = (rs.rtype == 0) ? 3.8f : 2.5f;
             std::vector<float> ys;
-            computePolyElevs(rs.pts, rs.isBridge != 0, rs.isBridge ? 1 : 0, 0.25f, ys);
+            computeV2PolyElevs(rs.pts, rs.isBridge != 0, rs.isBridge ? 1 : 0, 0.38f, hw, ys);
             for (size_t i = 0; i + 1 < rs.pts.size(); i++) {
                 Vec2 p0 = rs.pts[i], p1 = rs.pts[i + 1];
                 Vec2 d = p1 - p0;
@@ -4098,6 +4746,12 @@ static void buildIzbanAndRoadsDisplayList() {
 
     glEndList();
 }
+struct LandmarkGlowTower {
+    float cx, baseY, cz, baseW, baseD, height, twistDeg;
+    float r, g, b;
+};
+static std::vector<LandmarkGlowTower> g_landmarkGlowTowers;
+
 // Burgu (twist) yapan lofted kule yardimcisi (Folkart Towers twist = 45 derece, Mistral 216m)
 static void drawLoftedTwistedTower(float cx, float baseY, float cz, float baseW, float baseD,
                                    float height, float totalTwistDeg, int slices,
@@ -4130,7 +4784,7 @@ static void drawLoftedTwistedTower(float cx, float baseY, float cz, float baseW,
             Vec3 p10 = corner(hw0, hd0, a0, next); p10.y = y0;
             Vec3 p11 = corner(hw1, hd1, a1, next); p11.y = y1;
             Vec3 p01 = corner(hw1, hd1, a1, side); p01.y = y1;
-            Vec3 n = norm(cross(p10 - p00, p01 - p00));
+            Vec3 n = norm(cross(p01 - p00, p10 - p00)); // Disa donuk yuzey normali
             glNormal3f(n.x, n.y, n.z);
             glTexCoord2f(0.0f, t0 * 8.0f); glVertex3f(p00.x, p00.y, p00.z);
             glTexCoord2f(2.0f, t0 * 8.0f); glVertex3f(p10.x, p10.y, p10.z);
@@ -4139,9 +4793,9 @@ static void drawLoftedTwistedTower(float cx, float baseY, float cz, float baseW,
         }
         glEnd();
 
-        // Beyaz kat kusaklari (Folkart imzasi)
+        // Mimari kat kusaklari
         glDisable(GL_TEXTURE_2D);
-        glColor3f(0.95f, 0.96f, 0.98f);
+        glColor3f(0.92f, 0.95f, 0.98f);
         glBegin(GL_LINE_LOOP);
         for (int c = 0; c < 4; c++) {
             Vec3 pc = corner(hw1 * 1.01f, hd1 * 1.01f, a1, c);
@@ -4150,6 +4804,20 @@ static void drawLoftedTwistedTower(float cx, float baseY, float cz, float baseW,
         glEnd();
         glEnable(GL_TEXTURE_2D);
     }
+    // Cam tac parapet + celik zirve anteni + havacilik ikaz feneri
+    float topScale = 0.86f;
+    float topY = baseY + height;
+    glDisable(GL_TEXTURE_2D);
+    glBegin(GL_QUADS);
+    glColor3f(0.88f, 0.92f, 0.97f);
+    emitBoxFaces(cx, topY, cz, baseW * topScale, baseD * topScale, 2.2f,
+                 std::cos(totalTwistDeg * DEG2RAD), std::sin(totalTwistDeg * DEG2RAD), 1, 1);
+    glColor3f(0.75f, 0.78f, 0.84f);
+    emitBoxFaces(cx, topY + 2.2f, cz, 1.4f, 1.4f, 12.0f, 1, 0, 1, 1);
+    glEnd();
+    glEnable(GL_TEXTURE_2D);
+    g_nightBeaconLights.emplace_back(cx, topY + 14.5f, cz);
+    g_landmarkGlowTowers.push_back({cx, baseY, cz, baseW * 1.005f, baseD * 1.005f, height, totalTwistDeg, rCol, gCol, bCol});
 }
 
 // Pist + glPolygonOffset esik cizgileri + PAPI + ALS isiklari yardimcisi
@@ -4273,6 +4941,8 @@ static void drawRunwayWithMarkings(Vec2 center, float elev, float hdgDeg, float 
 }
 
 static void buildLandmarksAndAirportsDisplayList() {
+    g_nightBeaconLights.clear();
+    g_landmarkGlowTowers.clear();
     g_dlLandmarksAndAirports = glGenLists(1);
     glNewList(g_dlLandmarksAndAirports, GL_COMPILE);
 
@@ -4345,14 +5015,30 @@ static void buildLandmarksAndAirportsDisplayList() {
         }
         glEnd();
     }
-    // Kubbe
+    // Kubbe + altin alem diregi
     glColor3f(0.92f, 0.78f, 0.32f);
     glBegin(GL_TRIANGLE_FAN);
-    glVertex3f(sk.x, skY + 33.5f, sk.z);
+    glVertex3f(sk.x, skY + 33.8f, sk.z);
     for (int i = 0; i <= 8; i++) {
         float a = i * (2.0f * PI_F / 8.0f);
-        glVertex3f(sk.x + std::cos(a) * 1.9f, skY + 28.5f, sk.z + std::sin(a) * 1.9f);
+        glVertex3f(sk.x + std::cos(a) * 2.0f, skY + 28.5f, sk.z + std::sin(a) * 2.0f);
     }
+    glEnd();
+    // Saat Kulesi 4 mermer kemer sutu + 4 isikli saat kadrani + alem diregi
+    glBegin(GL_QUADS);
+    glColor3f(0.95f, 0.91f, 0.84f);
+    for (int f = 0; f < 4; f++) {
+        float a = f * (PI_F * 0.5f) + PI_F * 0.25f;
+        emitBoxFaces(sk.x + std::cos(a) * 4.2f, skY + 3.0f, sk.z + std::sin(a) * 4.2f, 0.85f, 0.85f, 4.8f, 1, 0, 1, 1);
+    }
+    for (int d = 0; d < 4; d++) {
+        float a = d * (PI_F * 0.5f);
+        glColor3f(0.98f, 0.95f, 0.78f);
+        emitBoxFaces(sk.x + std::cos(a) * 2.55f, skY + 21.8f, sk.z + std::sin(a) * 2.55f,
+                     1.45f, 0.25f, 1.45f, std::sin(a), -std::cos(a), 1, 1);
+    }
+    glColor3f(0.95f, 0.82f, 0.32f);
+    emitBoxFaces(sk.x, skY + 33.5f, sk.z, 0.35f, 0.35f, 3.2f, 1, 0, 1, 1);
     glEnd();
     // Konak Yali Camii (Saat Kulesinin 55m dogusunda sekizgen cinili cami + minare)
     glBegin(GL_QUADS);
@@ -4458,14 +5144,41 @@ static void buildLandmarksAndAirportsDisplayList() {
             emitBoxFaces(portP.x - 180.0f + c * 135.0f, portY + 11.5f, cz + 128.0f, 94.0f, 38.0f, 1.4f, 1, 0, 1, 1);
         }
     }
-    // Alsancak Kruvaziyer Иskelesi aciginda denizde demirli 240m Kruvaziyer Gemisi
+    // Alsancak Kruvaziyer Iskelesi aciginda denizde demirli 240m Kruvaziyer Gemisi (Sivri pruva + cam balkon guverteleri + baca)
     Vec2 shipP = geoPt(38.4445, 27.1388);
-    glColor3f(0.95f, 0.96f, 0.98f);
-    emitBoxFaces(shipP.x, 0.0f, shipP.z, 32.0f, 230.0f, 16.0f, 0.78f, 0.62f, 1, 1);
-    glColor3f(0.88f, 0.92f, 0.98f);
-    emitBoxFaces(shipP.x, 16.0f, shipP.z, 26.0f, 188.0f, 15.0f, 0.78f, 0.62f, 1, 1);
-    glColor3f(0.14f, 0.38f, 0.78f);
-    emitBoxFaces(shipP.x, 31.0f, shipP.z + 12.0f, 9.5f, 22.0f, 13.0f, 0.78f, 0.62f, 1, 1);
+    {
+        Vec2 sR(0.78f, 0.62f), sF(-0.62f, 0.78f);
+        // Alt celik tekne govdesi ve konik sivri pruva (bow)
+        glColor3f(0.14f, 0.22f, 0.38f);
+        emitBoxFaces(shipP.x, 0.0f, shipP.z, 30.0f, 175.0f, 8.5f, sR.x, sR.z, 1, 1);
+        Vec2 bowBase = shipP + sF * 87.5f, bowTip = shipP + sF * 124.0f;
+        Vec2 bL = bowBase - sR * 15.0f, bR = bowBase + sR * 15.0f;
+        glColor3f(0.16f, 0.26f, 0.44f);
+        glNormal3f(-sR.x * 0.8f, 0.1f, sF.x * 0.4f);
+        glVertex3f(bL.x, 0.0f, bL.z); glVertex3f(bowTip.x, 0.0f, bowTip.z);
+        glVertex3f(bowTip.x, 10.5f, bowTip.z); glVertex3f(bL.x, 8.5f, bL.z);
+        glNormal3f(sR.x * 0.8f, 0.1f, sF.z * 0.4f);
+        glVertex3f(bowTip.x, 0.0f, bowTip.z); glVertex3f(bR.x, 0.0f, bR.z);
+        glVertex3f(bR.x, 8.5f, bR.z); glVertex3f(bowTip.x, 10.5f, bowTip.z);
+        glNormal3f(0.0f, 1.0f, 0.0f);
+        glColor3f(0.86f, 0.89f, 0.93f);
+        glVertex3f(bL.x, 8.5f, bL.z); glVertex3f(bowTip.x, 10.5f, bowTip.z);
+        glVertex3f(bowTip.x, 10.5f, bowTip.z); glVertex3f(bR.x, 8.5f, bR.z);
+        // Ust beyaz yolcu guverteleri + cam seritler
+        glColor3f(0.96f, 0.97f, 0.99f);
+        emitBoxFaces(shipP.x, 8.5f, shipP.z, 31.0f, 185.0f, 8.5f, sR.x, sR.z, 1, 1);
+        glColor3f(0.24f, 0.46f, 0.72f);
+        emitBoxFaces(shipP.x, 11.2f, shipP.z, 31.4f, 172.0f, 3.2f, sR.x, sR.z, 1, 1);
+        glColor3f(0.92f, 0.95f, 0.98f);
+        emitBoxFaces(shipP.x - sF.x * 8.0f, 17.0f, shipP.z - sF.z * 8.0f, 25.0f, 152.0f, 11.0f, sR.x, sR.z, 1, 1);
+        // Kopru ustu + baca
+        glColor3f(0.97f, 0.98f, 1.00f);
+        emitBoxFaces(shipP.x + sF.x * 64.0f, 28.0f, shipP.z + sF.z * 64.0f, 32.0f, 16.0f, 4.5f, sR.x, sR.z, 1, 1);
+        glColor3f(0.14f, 0.38f, 0.78f);
+        emitBoxFaces(shipP.x - sF.x * 16.0f, 28.0f, shipP.z - sF.z * 16.0f, 9.0f, 20.0f, 13.0f, sR.x, sR.z, 1, 1);
+        glColor3f(0.88f, 0.22f, 0.18f);
+        emitBoxFaces(shipP.x - sF.x * 18.0f, 41.0f, shipP.z - sF.z * 18.0f, 7.5f, 14.0f, 2.5f, sR.x, sR.z, 1, 1);
+    }
     glEnd();
     drawTextWorld(Vec3(portP.x, portY + 62.0f, portP.z), 0.0f, 0.7f, "ALSANCAK LIMANI", 1.0f, 0.95f, 0.75f);
 
@@ -4697,6 +5410,212 @@ static void sampleIzbanAtS(float s, Vec3& posOut, Vec2& tangOut) {
     tangOut = norm2(g_izbanTangents[idx - 1] * (1.0f - t) + g_izbanTangents[idx] * t);
 }
 
+static inline const std::vector<RoadSpline>& activeTrafficRoutes() {
+    return (g_hasV2Roads && !g_v2DriveRoutes.empty()) ? g_v2DriveRoutes : g_roads;
+}
+
+static void buildV2DriveRoutes() {
+    ensureV2MajorRoadElevs();
+    g_v2DriveRoutes.clear();
+    const int nMaj = (int)g_v2MajorRoads.size();
+    if (nMaj == 0) return;
+
+    struct PieceInfo {
+        int majIdx;
+        float length;
+        Vec2 tStart, tEnd;
+    };
+    std::vector<PieceInfo> pieces;
+    pieces.reserve(nMaj);
+    for (int i = 0; i < nMaj; i++) {
+        const auto& rp = g_v2MajorRoads[i];
+        if (rp.tier > 2 || rp.pts.size() < 2 || rp.ys.size() != rp.pts.size()) continue;
+        float L = 0.0f;
+        for (size_t k = 0; k + 1 < rp.pts.size(); k++) L += len2(rp.pts[k + 1] - rp.pts[k]);
+        if (L < 12.0f) continue;
+        Vec2 t0 = norm2(rp.pts[1] - rp.pts[0]);
+        Vec2 t1 = norm2(rp.pts.back() - rp.pts[rp.pts.size() - 2]);
+        if (len2(t0) < 0.1f || len2(t1) < 0.1f) continue;
+        pieces.push_back({i, L, t0, t1});
+    }
+    if (pieces.empty()) return;
+
+    std::vector<int> order(pieces.size());
+    for (size_t i = 0; i < pieces.size(); i++) order[i] = (int)i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return pieces[a].length > pieces[b].length;
+    });
+
+    const int NB = OSM_CK_NX * OSM_CK_NZ;
+    std::vector<std::vector<int>> epBuckets(NB);
+    auto bucketIdx = [&](float wx, float wz) -> int {
+        int cx = clampi((int)((wx - WORLD_X0) / OSM_CHUNK_SZ), 0, OSM_CK_NX - 1);
+        int cz = clampi((int)((wz - WORLD_Z0) / OSM_CHUNK_SZ), 0, OSM_CK_NZ - 1);
+        return cz * OSM_CK_NX + cx;
+    };
+    for (int pi = 0; pi < (int)pieces.size(); pi++) {
+        const auto& rp = g_v2MajorRoads[pieces[pi].majIdx];
+        int b0 = bucketIdx(rp.pts.front().x, rp.pts.front().z);
+        int b1 = bucketIdx(rp.pts.back().x, rp.pts.back().z);
+        epBuckets[b0].push_back(pi);
+        if (b1 != b0) epBuckets[b1].push_back(pi);
+    }
+
+    std::vector<uint8_t> used(pieces.size(), 0);
+    auto findBestNext = [&](Vec2 endPt, float endY, Vec2 endTang, uint8_t tier,
+                            bool& outReversed) -> int {
+        int cx0 = clampi((int)((endPt.x - WORLD_X0) / OSM_CHUNK_SZ), 0, OSM_CK_NX - 1);
+        int cz0 = clampi((int)((endPt.z - WORLD_Z0) / OSM_CHUNK_SZ), 0, OSM_CK_NZ - 1);
+        int bestPi = -1;
+        float bestScore = -1e9f;
+        bool bestRev = false;
+        const float maxD2 = 4.5f * 4.5f;
+        for (int dz = -1; dz <= 1; dz++) {
+            int cz = cz0 + dz;
+            if (cz < 0 || cz >= OSM_CK_NZ) continue;
+            for (int dx = -1; dx <= 1; dx++) {
+                int cx = cx0 + dx;
+                if (cx < 0 || cx >= OSM_CK_NX) continue;
+                for (int pi : epBuckets[cz * OSM_CK_NX + cx]) {
+                    if (used[pi]) continue;
+                    const auto& rp = g_v2MajorRoads[pieces[pi].majIdx];
+                    if (rp.tier != tier) continue;
+                    {
+                        Vec2 pS = rp.pts.front();
+                        float d2 = (pS.x - endPt.x) * (pS.x - endPt.x) + (pS.z - endPt.z) * (pS.z - endPt.z);
+                        float dy = std::fabs(rp.ys.front() - endY);
+                        if (d2 <= maxD2 && dy <= 2.2f) {
+                            float dp = dot2(endTang, pieces[pi].tStart);
+                            if (dp > 0.45f) {
+                                float score = dp - 0.05f * d2;
+                                if (score > bestScore) { bestScore = score; bestPi = pi; bestRev = false; }
+                            }
+                        }
+                    }
+                    {
+                        Vec2 pE = rp.pts.back();
+                        float d2 = (pE.x - endPt.x) * (pE.x - endPt.x) + (pE.z - endPt.z) * (pE.z - endPt.z);
+                        float dy = std::fabs(rp.ys.back() - endY);
+                        if (d2 <= maxD2 && dy <= 2.2f) {
+                            float dp = dot2(endTang, pieces[pi].tEnd * -1.0f);
+                            if (dp > 0.45f) {
+                                float score = dp - 0.05f * d2;
+                                if (score > bestScore) { bestScore = score; bestPi = pi; bestRev = true; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        outReversed = bestRev;
+        return bestPi;
+    };
+
+    auto appendPiece = [](std::vector<Vec3>& dst, const V2MajorRoadPoly& rp, bool rev) {
+        size_t n = rp.pts.size();
+        for (size_t k = 0; k < n; k++) {
+            size_t idx = rev ? (n - 1 - k) : k;
+            Vec3 np(rp.pts[idx].x, rp.ys[idx], rp.pts[idx].z);
+            if (!dst.empty()) {
+                float dx = np.x - dst.back().x, dz = np.z - dst.back().z;
+                if (dx * dx + dz * dz < 0.25f) continue;
+            }
+            dst.push_back(np);
+        }
+    };
+
+    for (int seedPi : order) {
+        if (used[seedPi]) continue;
+        used[seedPi] = 1;
+        const auto& seedRp = g_v2MajorRoads[pieces[seedPi].majIdx];
+        uint8_t tier = seedRp.tier;
+        float minHW = seedRp.halfW;
+
+        std::vector<Vec3> chain;
+        appendPiece(chain, seedRp, false);
+
+        for (int hop = 0; hop < 400 && chain.size() >= 2; hop++) {
+            Vec2 endPt(chain.back().x, chain.back().z);
+            Vec2 prevPt(chain[chain.size() - 2].x, chain[chain.size() - 2].z);
+            bool rev = false;
+            int nxt = findBestNext(endPt, chain.back().y, norm2(endPt - prevPt), tier, rev);
+            if (nxt < 0) break;
+            used[nxt] = 1;
+            const auto& nxtRp = g_v2MajorRoads[pieces[nxt].majIdx];
+            minHW = std::min(minHW, nxtRp.halfW);
+            appendPiece(chain, nxtRp, rev);
+        }
+
+        std::reverse(chain.begin(), chain.end());
+        for (int hop = 0; hop < 400 && chain.size() >= 2; hop++) {
+            Vec2 endPt(chain.back().x, chain.back().z);
+            Vec2 prevPt(chain[chain.size() - 2].x, chain[chain.size() - 2].z);
+            bool rev = false;
+            int nxt = findBestNext(endPt, chain.back().y, norm2(endPt - prevPt), tier, rev);
+            if (nxt < 0) break;
+            used[nxt] = 1;
+            const auto& nxtRp = g_v2MajorRoads[pieces[nxt].majIdx];
+            minHW = std::min(minHW, nxtRp.halfW);
+            appendPiece(chain, nxtRp, rev);
+        }
+        std::reverse(chain.begin(), chain.end());
+
+        if (chain.size() < 2) continue;
+        float cum = 0.0f;
+        std::vector<float> cumD(chain.size(), 0.0f);
+        std::vector<Vec2> tangs(chain.size(), Vec2(1.0f, 0.0f));
+        for (size_t i = 0; i < chain.size(); i++) {
+            if (i > 0) {
+                float dx = chain[i].x - chain[i - 1].x;
+                float dz = chain[i].z - chain[i - 1].z;
+                cum += std::sqrt(dx * dx + dz * dz);
+                cumD[i] = cum;
+            }
+            Vec2 a = (i == 0) ? Vec2(chain[0].x, chain[0].z) : Vec2(chain[i - 1].x, chain[i - 1].z);
+            Vec2 b = (i + 1 == chain.size()) ? Vec2(chain.back().x, chain.back().z) : Vec2(chain[i + 1].x, chain[i + 1].z);
+            Vec2 td = norm2(b - a);
+            tangs[i] = (len2(td) > 0.1f) ? td : Vec2(1.0f, 0.0f);
+        }
+        if (cum < 250.0f) continue;
+
+        RoadSpline rs;
+        rs.name = (tier == 0) ? "v2-otoyol" : ((tier == 1) ? "v2-bulvar" : "v2-ana-arter");
+        rs.type = tier;
+        rs.halfW = std::max(3.6f, minHW);
+        rs.lanes = (rs.halfW >= 8.0f) ? 2 : 1;
+        rs.pts = std::move(chain);
+        rs.tangs = std::move(tangs);
+        rs.cumDist = std::move(cumD);
+        rs.totalLen = cum;
+        g_v2DriveRoutes.push_back(std::move(rs));
+    }
+}
+
+static void sampleTrafficVehiclePose(const RoadSpline& rs, const RoadVehicle& v, Vec3& outPos, Vec2& outRight) {
+    float s = clampf(v.s, 0.0f, rs.totalLen);
+    auto it = std::lower_bound(rs.cumDist.begin(), rs.cumDist.end(), s);
+    size_t idx = (it == rs.cumDist.end()) ? (rs.pts.size() - 1) : (size_t)(it - rs.cumDist.begin());
+    Vec3 p = rs.pts[idx];
+    Vec2 tang = rs.tangs[idx];
+    if (idx > 0 && idx < rs.pts.size()) {
+        float s0 = rs.cumDist[idx - 1], s1 = rs.cumDist[idx];
+        float span = s1 - s0;
+        if (span > 1e-4f) {
+            float u = clampf((s - s0) / span, 0.0f, 1.0f);
+            p = lerpV(rs.pts[idx - 1], rs.pts[idx], u);
+            Vec2 td = norm2(Vec2(rs.pts[idx].x - rs.pts[idx - 1].x, rs.pts[idx].z - rs.pts[idx - 1].z));
+            if (len2(td) > 0.1f) tang = td;
+        }
+    }
+    Vec2 t = tang * (float)v.dir;
+    Vec2 n(-t.z, t.x); // Surucu sag seridi
+    float laneSpacing = (rs.lanes > 1) ? std::min(3.2f, std::max(1.8f, rs.halfW - 2.8f)) : 0.0f;
+    float laneBase = (rs.halfW >= 7.5f) ? 2.4f : 1.7f;
+    float laneOff = clampf(laneBase + (float)v.lane * laneSpacing, 1.2f, std::max(1.4f, rs.halfW - 1.4f));
+    outPos = Vec3(p.x + n.x * laneOff, p.y + 0.12f, p.z + n.z * laneOff);
+    outRight = n;
+}
+
 static void initDynamicTraffic() {
     // 8 adet 3-vagonlu IZBAN treni (hat boyunca dagitilmis, 4'u guney yonlu, 4'u kuzey yonlu)
     for (int i = 0; i < NUM_IZBAN_TRAINS; i++) {
@@ -4731,16 +5650,24 @@ static void initDynamicTraffic() {
     }
 
     // Otoyol araclari (cift yonlu akan trafik)
+    g_v2DriveRoutes.clear();
+    if (g_hasV2Roads) buildV2DriveRoutes();
+    const std::vector<RoadSpline>& driveRoutes = activeTrafficRoutes();
+    bool usingV2Routes = (g_hasV2Roads && !g_v2DriveRoutes.empty());
     g_vehicles.clear();
     Rng vrng(998877u);
-    for (int r = 0; r < (int)g_roads.size(); r++) {
-        int count = std::max(30, (int)(g_roads[r].totalLen / 180.0f));
+    float densityDiv = usingV2Routes ? 240.0f : 180.0f;
+    int minPerRoute = usingV2Routes ? 2 : 30;
+    int maxPerRoute = usingV2Routes ? 45 : 200;
+    for (int r = 0; r < (int)driveRoutes.size(); r++) {
+        if (driveRoutes[r].totalLen < 20.0f || driveRoutes[r].pts.size() < 2) continue;
+        int count = clampi((int)(driveRoutes[r].totalLen / densityDiv), minPerRoute, maxPerRoute);
         for (int k = 0; k < count; k++) {
             RoadVehicle v;
             v.roadIdx = r;
-            v.s = vrng.range(0.0f, g_roads[r].totalLen);
+            v.s = vrng.range(0.0f, driveRoutes[r].totalLen);
             v.dir = (k & 1) ? -1 : 1;
-            v.lane = k % g_roads[r].lanes;
+            v.lane = k % std::max(1, driveRoutes[r].lanes);
             v.kind = (uint8_t)(k % 7 == 0 ? 1 : (k % 11 == 0 ? 2 : 0));
             v.speed = (v.kind == 0) ? vrng.range(24.0f, 34.0f) : vrng.range(18.0f, 24.0f);
             g_vehicles.push_back(v);
@@ -4788,16 +5715,29 @@ static void updateDynamicTraffic(float dt) {
     }
 
     // 3. Otoyol araclarini guncelle
+    const std::vector<RoadSpline>& routes = activeTrafficRoutes();
     for (auto& v : g_vehicles) {
-        const RoadSpline& rs = g_roads[v.roadIdx];
+        if (v.roadIdx < 0 || v.roadIdx >= (int)routes.size()) continue;
+        const RoadSpline& rs = routes[v.roadIdx];
         v.s += v.dir * v.speed * dt;
         if (v.s > rs.totalLen) v.s -= rs.totalLen;
         if (v.s < 0.0f) v.s += rs.totalLen;
     }
 }
 
-static void renderDynamicTrafficAndBeacons(float simTime, int timeOfDay) {
-    // 1. 28 IZBAN Istasyonu: Zemin-Kule arasi Dikey Isik Sutunu + 75m Donen 3D Elmas + 3D Etiket
+static void renderDynamicTrafficAndBeacons(float simTime, int timeOfDay, const Vec3& eye, const Vec2& camFwd2D) {
+    auto isVisible2D = [&](float wx, float wz, float maxDist, float minCos) -> bool {
+        float dx = wx - eye.x, dz = wz - eye.z;
+        float d2 = dx * dx + dz * dz;
+        if (d2 > maxDist * maxDist) return false;
+        if (d2 > 750.0f * 750.0f) {
+            float d = std::sqrt(d2);
+            if ((dx * camFwd2D.x + dz * camFwd2D.z) < d * minCos) return false;
+        }
+        return true;
+    };
+
+    // 1. 28 IZBAN Istasyonu: Zemin-Kule arasi Dikey Isik Sutunu + 75m Donen 3D Elmas + 3D Etiket (mesafe + gorus konisi budamali)
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_LIGHTING);
     glEnable(GL_BLEND);
@@ -4805,6 +5745,7 @@ static void renderDynamicTrafficAndBeacons(float simTime, int timeOfDay) {
     glBegin(GL_QUADS);
     for (int s = 0; s < NUM_STATIONS; s++) {
         Vec3 sp = g_stationPos[s];
+        if (!isVisible2D(sp.x, sp.z, 13000.0f, 0.20f)) continue;
         float bw = 2.2f;
         glColor4f(0.10f, 0.90f, 1.0f, 0.28f);
         glVertex3f(sp.x - bw, sp.y + 2.0f, sp.z);
@@ -4825,7 +5766,9 @@ static void renderDynamicTrafficAndBeacons(float simTime, int timeOfDay) {
     float ca = std::cos(rotA), sa = std::sin(rotA);
     glBegin(GL_TRIANGLES);
     for (int s = 0; s < NUM_STATIONS; s++) {
-        Vec3 c = g_stationPos[s] + Vec3(0.0f, 75.0f + std::sin(simTime * 3.0f + s) * 2.5f, 0.0f);
+        Vec3 sp = g_stationPos[s];
+        if (!isVisible2D(sp.x, sp.z, 11000.0f, 0.20f)) continue;
+        Vec3 c = sp + Vec3(0.0f, 75.0f + std::sin(simTime * 3.0f + s) * 2.5f, 0.0f);
         float r = 7.5f, h = 12.0f;
         Vec3 top = c + Vec3(0, h, 0), bot = c - Vec3(0, h, 0);
         Vec3 p0(c.x + ca * r, c.y, c.z + sa * r);
@@ -4839,7 +5782,6 @@ static void renderDynamicTrafficAndBeacons(float simTime, int timeOfDay) {
             glColor3f(0.08f, 0.58f, 0.98f);
             glVertex3f(bot.x, bot.y, bot.z); glVertex3f(ring[k + 1].x, ring[k + 1].y, ring[k + 1].z); glVertex3f(ring[k].x, ring[k].y, ring[k].z);
         }
-        // Parlayan altin cekirdek
         for (int k = 0; k < 4; k++) {
             glColor3f(1.0f, 0.95f, 0.35f);
             glVertex3f(c.x, c.y + 4.5f, c.z);
@@ -4850,10 +5792,11 @@ static void renderDynamicTrafficAndBeacons(float simTime, int timeOfDay) {
     glEnd();
 
     for (int s = 0; s < NUM_STATIONS; s++) {
+        Vec3 sp = g_stationPos[s];
+        if (!isVisible2D(sp.x, sp.z, 6200.0f, 0.25f)) continue;
         char bTxt[64];
         std::snprintf(bTxt, sizeof(bTxt), "[%d/28] %s", s + 1, STATIONS[s].name);
-        drawTextWorld(Vec3(g_stationPos[s].x, g_stationPos[s].y + 90.0f, g_stationPos[s].z),
-                      0.0f, 0.85f, bTxt, 0.25f, 1.0f, 1.0f);
+        drawTextWorld(Vec3(sp.x, sp.y + 90.0f, sp.z), 0.0f, 0.85f, bTxt, 0.25f, 1.0f, 1.0f);
     }
     glEnable(GL_LIGHTING);
 
@@ -4866,14 +5809,13 @@ static void renderDynamicTrafficAndBeacons(float simTime, int timeOfDay) {
             float carS = clampf(tr.s + car * 23.5f, 0.0f, g_izbanTotalLen);
             Vec3 cp; Vec2 ct;
             sampleIzbanAtS(carS, cp, ct);
+            if (!isVisible2D(cp.x, cp.z, 5500.0f, 0.20f)) continue;
             Vec2 cn(-ct.z, ct.x);
             float cx = cp.x + cn.x * trackLat;
             float cz = cp.z + cn.z * trackLat;
             float cy = cp.y + 0.45f;
-            // Alt mavi etek
             glColor3f(0.10f, 0.34f, 0.78f);
             emitBoxFaces(cx, cy, cz, 3.0f, 22.0f, 1.2f, cn.x, cn.z, 1, 1);
-            // Orta beyaz govde + kirmizi serit
             glColor3f(0.95f, 0.96f, 0.98f);
             emitBoxFaces(cx, cy + 1.2f, cz, 3.0f, 22.0f, 2.1f, cn.x, cn.z, 1, 1);
             glColor3f(0.88f, 0.14f, 0.16f);
@@ -4882,20 +5824,20 @@ static void renderDynamicTrafficAndBeacons(float simTime, int timeOfDay) {
     }
     glEnd();
 
-    // 3. 6 Adet Canli 3D IZDENIZ Korfez Vapuru + Kopuklu V-Su Izi (Wake)
+    // 3. 6 Adet Canli 3D IZDENIZ Katamaran / Vapur + Sivri Pruva + Kopuklu V-Su Izi
     for (int i = 0; i < NUM_FERRIES; i++) {
         const FerryBoat& fb = g_ferries[i];
+        if (!isVisible2D(fb.pos.x, fb.pos.z, 12000.0f, 0.15f)) continue;
         Vec2 f = fb.fwd;
         Vec2 r(-f.z, f.x);
-        // Kopuklu V-su izi (wake)
         glDisable(GL_LIGHTING);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        Vec2 stern = fb.pos - f * 22.0f;
-        Vec2 wL = stern - f * 125.0f - r * 36.0f;
-        Vec2 wR = stern - f * 125.0f + r * 36.0f;
+        Vec2 stern = fb.pos - f * 20.0f;
+        Vec2 wL = stern - f * 120.0f - r * 34.0f;
+        Vec2 wR = stern - f * 120.0f + r * 34.0f;
         glBegin(GL_TRIANGLES);
-        glColor4f(0.92f, 0.97f, 1.0f, 0.72f);
+        glColor4f(0.92f, 0.97f, 1.0f, 0.70f);
         glVertex3f(stern.x, 0.18f, stern.z);
         glColor4f(0.85f, 0.95f, 1.0f, 0.0f);
         glVertex3f(wL.x, 0.18f, wL.z);
@@ -4904,59 +5846,64 @@ static void renderDynamicTrafficAndBeacons(float simTime, int timeOfDay) {
         glDisable(GL_BLEND);
         glEnable(GL_LIGHTING);
 
-        // 3D IZDENIZ Katamaran / Vapur Govdesi
+        // Sivri pruvali 3D Katamaran / Vapur Govdesi
         glBegin(GL_QUADS);
-        glColor3f(0.12f, 0.28f, 0.62f);
-        emitBoxFaces(fb.pos.x, 0.0f, fb.pos.z, 11.5f, 42.0f, 3.2f, r.x, r.z, 1, 1);
+        glColor3f(0.10f, 0.28f, 0.64f);
+        emitBoxFaces(fb.pos.x, 0.0f, fb.pos.z, 11.4f, 34.0f, 2.8f, r.x, r.z, 1, 1);
+        Vec2 bowBase = fb.pos + f * 17.0f, bowTip = fb.pos + f * 25.0f;
+        Vec2 bL = bowBase - r * 5.7f, bR = bowBase + r * 5.7f;
+        glColor3f(0.12f, 0.34f, 0.72f);
+        glVertex3f(bL.x, 0.0f, bL.z); glVertex3f(bowTip.x, 0.0f, bowTip.z);
+        glVertex3f(bowTip.x, 3.2f, bowTip.z); glVertex3f(bL.x, 2.8f, bL.z);
+        glVertex3f(bowTip.x, 0.0f, bowTip.z); glVertex3f(bR.x, 0.0f, bR.z);
+        glVertex3f(bR.x, 2.8f, bR.z); glVertex3f(bowTip.x, 3.2f, bowTip.z);
         glColor3f(0.96f, 0.97f, 0.99f);
-        emitBoxFaces(fb.pos.x, 3.2f, fb.pos.z, 10.2f, 34.0f, 4.2f, r.x, r.z, 1, 1);
-        glColor3f(0.88f, 0.22f, 0.18f);
-        emitBoxFaces(fb.pos.x, 7.4f, fb.pos.z - f.x * 4.0f, 4.0f, 9.0f, 2.8f, r.x, r.z, 1, 1);
+        emitBoxFaces(fb.pos.x, 2.8f, fb.pos.z, 10.4f, 30.0f, 3.8f, r.x, r.z, 1, 1);
+        glColor3f(timeOfDay >= 1 ? 1.0f : 0.18f, timeOfDay >= 1 ? 0.88f : 0.44f, timeOfDay >= 1 ? 0.50f : 0.76f);
+        emitBoxFaces(fb.pos.x, 3.7f, fb.pos.z, 10.6f, 24.0f, 1.5f, r.x, r.z, 1, 1);
+        glColor3f(0.88f, 0.20f, 0.16f);
+        emitBoxFaces(fb.pos.x - f.x * 4.0f, 6.6f, fb.pos.z - f.z * 4.0f, 4.2f, 8.5f, 2.4f, r.x, r.z, 1, 1);
         glEnd();
     }
 
-    // 4. Akan Cift Yonlu 3D Otoyol Arac Trafigi
-    glBegin(GL_QUADS);
+    // 4. Akan Cift Yonlu 3D Otoyol Arac Trafigi (2.6km gorus konisi icindekiler tek geciste cizilir)
+    struct VisVeh { Vec3 pos; Vec2 n; uint8_t kind; int dir; };
+    static std::vector<VisVeh> visVehicles;
+    visVehicles.clear();
+    const std::vector<RoadSpline>& routes = activeTrafficRoutes();
     for (const auto& v : g_vehicles) {
-        const RoadSpline& rs = g_roads[v.roadIdx];
-        auto it = std::lower_bound(rs.cumDist.begin(), rs.cumDist.end(), v.s);
-        size_t idx = (it == rs.cumDist.end()) ? (rs.pts.size() - 1) : (size_t)(it - rs.cumDist.begin());
-        Vec3 p = rs.pts[idx];
-        Vec2 t = rs.tangs[idx] * (float)v.dir;
-        Vec2 n(-t.z, t.x);
-        float laneOff = (v.dir > 0 ? 1.0f : -1.0f) * (2.6f + v.lane * 3.6f);
-        float vx = p.x + n.x * laneOff;
-        float vz = p.z + n.z * laneOff;
-        float vy = p.y + 0.12f;
+        if (v.roadIdx < 0 || v.roadIdx >= (int)routes.size()) continue;
+        const RoadSpline& rs = routes[v.roadIdx];
+        Vec3 vp; Vec2 n;
+        sampleTrafficVehiclePose(rs, v, vp, n);
+        if (!isVisible2D(vp.x, vp.z, 2600.0f, 0.15f)) continue;
+        visVehicles.push_back({vp, n, v.kind, v.dir});
+    }
 
-        if (v.kind == 1) {
-            // ESHOT Kirmizi Belediye Otobusu
+    glBegin(GL_QUADS);
+    for (const auto& vv : visVehicles) {
+        if (vv.kind == 1) {
             glColor3f(0.88f, 0.14f, 0.14f);
-            emitBoxFaces(vx, vy, vz, 2.6f, 12.0f, 3.2f, n.x, n.z, 1, 1);
-        } else if (v.kind == 2) {
-            // Konteyner Tiri
+            emitBoxFaces(vv.pos.x, vv.pos.y, vv.pos.z, 2.6f, 12.0f, 3.2f, vv.n.x, vv.n.z, 1, 1);
+        } else if (vv.kind == 2) {
             glColor3f(0.24f, 0.52f, 0.84f);
-            emitBoxFaces(vx, vy, vz, 2.6f, 14.5f, 3.8f, n.x, n.z, 1, 1);
+            emitBoxFaces(vv.pos.x, vv.pos.y, vv.pos.z, 2.6f, 14.5f, 3.8f, vv.n.x, vv.n.z, 1, 1);
         } else {
             glColor3f(0.82f, 0.84f, 0.88f);
-            emitBoxFaces(vx, vy, vz, 2.0f, 4.6f, 1.6f, n.x, n.z, 1, 1);
+            emitBoxFaces(vv.pos.x, vv.pos.y, vv.pos.z, 2.0f, 4.6f, 1.6f, vv.n.x, vv.n.z, 1, 1);
         }
     }
     glEnd();
 
-    // Gunbatimi / Gece modunda arac farlari ve sehir isiklari
-    if (timeOfDay >= 1) {
+    // Gunbatimi / Gece modunda arac farlari ve stop lambalari
+    if (timeOfDay >= 1 && !visVehicles.empty()) {
         glDisable(GL_LIGHTING);
-        glPointSize(3.5f);
+        glPointSize(3.8f);
         glBegin(GL_POINTS);
-        for (const auto& v : g_vehicles) {
-            const RoadSpline& rs = g_roads[v.roadIdx];
-            auto it = std::lower_bound(rs.cumDist.begin(), rs.cumDist.end(), v.s);
-            size_t idx = (it == rs.cumDist.end()) ? (rs.pts.size() - 1) : (size_t)(it - rs.cumDist.begin());
-            Vec3 p = rs.pts[idx];
-            if (v.dir > 0) glColor3f(1.0f, 0.96f, 0.80f);
+        for (const auto& vv : visVehicles) {
+            if (vv.dir > 0) glColor3f(1.0f, 0.96f, 0.80f);
             else glColor3f(1.0f, 0.18f, 0.12f);
-            glVertex3f(p.x, p.y + 1.4f, p.z);
+            glVertex3f(vv.pos.x, vv.pos.y + 1.15f, vv.pos.z);
         }
         glEnd();
         glEnable(GL_LIGHTING);
@@ -4989,12 +5936,65 @@ static const AircraftSpec AC_SPECS[NUM_AIRCRAFT] = {
     {"DG-1000 AKROBASİ PLANÖRÜ (20M KANAT)",         620.0f, 17.5f, 20.0f,  1800.0f,  2600.0f, 0.012f, 6.1f, 1.75f, 14.5f, 1.35f, 0.95f, 0.65f}
 };
 
+enum {
+    PT_SMOKE_RIBBON = 0,
+    PT_FLAME        = 1,
+    PT_BLACK_SMOKE  = 2,
+    PT_SPARK        = 3,
+    PT_WATER_SPRAY  = 4
+};
+
 struct SmokePoint {
     Vec3 pos;
     Vec3 vel;
-    float life;
-    float maxLife;
-    float r, g, b, size;
+    float life = 1.0f;
+    float maxLife = 1.0f;
+    float r = 1.0f, g = 1.0f, b = 1.0f, size = 1.0f;
+    float growthRate = 1.4f;
+    uint8_t ptype = PT_SMOKE_RIBBON;
+};
+
+struct ExplosionEffect {
+    Vec3 pos;
+    Vec3 surfNorm{0, 1, 0};
+    float age = 0.0f;
+    float maxAge = 1.4f;
+    float maxRadius = 24.0f;
+    bool hitBuilding = false;
+};
+
+struct BulletProj {
+    Vec3 pos;
+    Vec3 prevPos;
+    Vec3 vel;
+    float life = 2.6f;
+};
+
+struct BombProj {
+    Vec3 pos;
+    Vec3 prevPos;
+    Vec3 vel;
+    float life = 14.0f;
+    float trailAccum = 0.0f;
+};
+
+struct FireEmitterNode {
+    Vec3 pos;
+    Vec3 outwardNorm{0, 1, 0};
+    float scale = 8.0f;
+    float phase = 0.0f;
+    bool isRoof = true;
+};
+
+struct ActiveFireZone {
+    Vec3 center;
+    float radius = 16.0f;
+    float buildingScale = 12.0f;
+    float timeLeft = 30.0f;
+    float maxDuration = 30.0f;
+    float emitAccum = 0.0f;
+    int primaryBldgIdx = -1;
+    std::vector<FireEmitterNode> nodes;
 };
 
 struct AircraftState {
@@ -5036,7 +6036,839 @@ struct AircraftState {
 };
 static AircraftState g_ac;
 static std::vector<SmokePoint> g_particles;
+static std::vector<ExplosionEffect> g_explosions;
+static std::vector<BulletProj> g_bullets;
+static std::vector<BombProj> g_bombs;
+static std::vector<ActiveFireZone> g_activeFires;
 static float g_smokeEmitTimer = 0.0f;
+static const size_t MAX_PARTICLES = 2400;
+static const size_t MAX_ACTIVE_FIRES = 16;
+static const float  BOMB_FIRE_DURATION = 30.0f;
+static size_t g_particleOverwriteCursor = 0;
+
+// Kamera sarsintisi (ekran titremesi) ve silah/HUD nisan durumu
+static float g_camShakeMag = 0.0f;
+static float g_camShakeTimer = 0.0f;
+static float g_camShakeDur = 1.0f;
+static float g_camShakePhase = 0.0f;
+static float g_lastShakeSimTime = 0.0f;
+
+static Vec3 g_lastCamEye(0, 100, 0);
+static Vec3 g_lastCamFwd(0, 0, -1);
+static Vec3 g_lastCamRight(1, 0, 0);
+static Vec3 g_lastCamUp(0, 1, 0);
+static int  g_lastWinW = 1280, g_lastWinH = 720;
+
+static float g_gunFireCd = 0.0f;
+static float g_bombDropCd = 0.0f;
+static bool  g_gunTriggerEdge = false;
+static bool  g_bombTriggerEdge = false;
+static bool  g_gunBarrelToggle = false;
+static uint32_t g_weaponVfxSeq = 1;
+
+static bool  g_gunAimValid = false;
+static bool  g_gunAimHitBldg = false;
+static Vec3  g_gunAimPos(0, 0, 0);
+static float g_gunAimDist = 0.0f;
+
+static bool  g_ccipValid = false;
+static bool  g_ccipHitBldg = false;
+static int   g_ccipHitBldgIdx = -1;
+static Vec3  g_ccipPos(0, 0, 0);
+static Vec3  g_ccipNorm(0, 1, 0);
+static float g_ccipFallTime = 0.0f;
+
+static void pushParticle(const SmokePoint& sp) {
+    if (g_particles.size() < MAX_PARTICLES) {
+        g_particles.push_back(sp);
+    } else if (sp.ptype != PT_SMOKE_RIBBON) {
+        g_particles[g_particleOverwriteCursor % MAX_PARTICLES] = sp;
+        g_particleOverwriteCursor++;
+    }
+}
+
+static void triggerCameraShake(float magnitude, float duration) {
+    if (duration <= 0.0f || magnitude <= 0.0f) return;
+    if (g_camShakeTimer > 0.0f) {
+        float remFrac = clampf(g_camShakeTimer / std::max(0.01f, g_camShakeDur), 0.0f, 1.0f);
+        float curActive = g_camShakeMag * remFrac;
+        g_camShakeMag = std::max(curActive, magnitude);
+    } else {
+        g_camShakeMag = magnitude;
+    }
+    g_camShakeDur = std::max(g_camShakeTimer, duration);
+    g_camShakeTimer = g_camShakeDur;
+}
+
+static bool projectWorldToHUD(const Vec3& wp, float& outX, float& outY) {
+    Vec3 rel = wp - g_lastCamEye;
+    float cz = dot(rel, g_lastCamFwd);
+    if (cz <= 1.5f) return false;
+    float cxCam = dot(rel, g_lastCamRight);
+    float cyCam = dot(rel, g_lastCamUp);
+    float tanHalfY = std::tan(31.0f * DEG2RAD);
+    float aspect = (float)g_lastWinW / (float)std::max(1, g_lastWinH);
+    float tanHalfX = tanHalfY * aspect;
+    float ndcX = cxCam / (cz * tanHalfX);
+    float ndcY = cyCam / (cz * tanHalfY);
+    outX = g_lastWinW * 0.5f * (1.0f + ndcX);
+    outY = g_lastWinH * 0.5f * (1.0f - ndcY);
+    return (outX >= -80.0f && outX <= g_lastWinW + 80.0f &&
+            outY >= -80.0f && outY <= g_lastWinH + 80.0f);
+}
+
+static inline Vec3 bldgLocalToWorld(const BuildingInst& b, float lx, float lyOffset, float lz) {
+    return Vec3(
+        b.x + lx * b.cosY - lz * b.sinY,
+        b.y + lyOffset,
+        b.z + lx * b.sinY + lz * b.cosY
+    );
+}
+
+static inline Vec3 bldgSurfaceNormalAt(const BuildingInst& b, const Vec3& hitPt) {
+    if (hitPt.y >= b.y + b.h - 2.2f) return Vec3(0.0f, 1.0f, 0.0f);
+    float dx = hitPt.x - b.x, dz = hitPt.z - b.z;
+    float lx = dx * b.cosY + dz * b.sinY;
+    float lz = -dx * b.sinY + dz * b.cosY;
+    float hw = std::max(0.5f, b.w * 0.5f);
+    float hd = std::max(0.5f, b.d * 0.5f);
+    float nlx = 0.0f, nlz = 0.0f;
+    if (std::fabs(lx) / hw >= std::fabs(lz) / hd) {
+        nlx = (lx >= 0.0f) ? 1.0f : -1.0f;
+    } else {
+        nlz = (lz >= 0.0f) ? 1.0f : -1.0f;
+    }
+    return Vec3(nlx * b.cosY - nlz * b.sinY, 0.0f, nlx * b.sinY + nlz * b.cosY);
+}
+
+// Tarama/Ray testi: Mermi, bomba ve HUD aim icin tum haritadaki binalara (OBB) ve araziye/denize carpisma testi
+static bool traceWeaponSegment(const Vec3& p0, const Vec3& p1, float hitRadius,
+                               Vec3& outPos, Vec3& outNorm, int& outBldgIdx, bool& outHitWater) {
+    Vec3 delta = p1 - p0;
+    float segLen = len(delta);
+    if (segLen < 1e-4f) return false;
+    int steps = std::max(1, (int)std::ceil(segLen / 1.5f));
+    float prevT = 0.0f;
+    for (int i = 1; i <= steps; i++) {
+        float t = (float)i / (float)steps;
+        Vec3 pt = p0 + delta * t;
+        int bIdx = findBuildingHitPoint(pt, hitRadius);
+        float terrY = sampleTerrainElev(pt.x, pt.z);
+        bool hitB = (bIdx >= 0);
+        bool hitT = (pt.y <= terrY + 0.15f);
+        if (hitB || hitT) {
+            float lo = prevT, hi = t;
+            int bestB = bIdx;
+            for (int it = 0; it < 5; it++) {
+                float mid = 0.5f * (lo + hi);
+                Vec3 mp = p0 + delta * mid;
+                int mb = findBuildingHitPoint(mp, hitRadius);
+                float mt = sampleTerrainElev(mp.x, mp.z);
+                if (mb >= 0 || mp.y <= mt + 0.15f) {
+                    hi = mid;
+                    if (mb >= 0) bestB = mb;
+                } else {
+                    lo = mid;
+                }
+            }
+            outPos = p0 + delta * hi;
+            if (bestB >= 0) {
+                const BuildingInst& b = g_allBuildings[bestB];
+                outBldgIdx = bestB;
+                outHitWater = false;
+                outNorm = bldgSurfaceNormalAt(b, outPos);
+                if (outNorm.y > 0.5f) outPos.y = b.y + b.h + 0.05f;
+            } else {
+                outBldgIdx = -1;
+                float sd = sampleSignedSeaDist(outPos.x, outPos.z);
+                outHitWater = (sd < -3.0f && terrY < 1.2f);
+                outPos.y = outHitWater ? 0.05f : (sampleTerrainElev(outPos.x, outPos.z) + 0.08f);
+                outNorm = outHitWater ? Vec3(0, 1, 0) : sampleTerrainNormal(outPos.x, outPos.z);
+            }
+            return true;
+        }
+        prevT = t;
+    }
+    return false;
+}
+
+static bool traceWeaponRay(const Vec3& origin, const Vec3& dirNorm, float maxDist, float hitRadius,
+                           Vec3& outPos, Vec3& outNorm, int& outBldgIdx, bool& outHitWater) {
+    float step = 6.0f;
+    float tPrev = 0.0f;
+    for (float t = step; t <= maxDist; t += step) {
+        Vec3 pPrev = origin + dirNorm * tPrev;
+        Vec3 pCur  = origin + dirNorm * t;
+        if (traceWeaponSegment(pPrev, pCur, hitRadius, outPos, outNorm, outBldgIdx, outHitWater)) {
+            return true;
+        }
+        tPrev = t;
+    }
+    outPos = origin + dirNorm * maxDist;
+    outNorm = Vec3(0, 1, 0);
+    outBldgIdx = -1;
+    outHitWater = false;
+    return false;
+}
+
+static void spawnExplosionAt(const Vec3& p, const Vec3& surfNorm, float scale,
+                             bool doShake, bool hitBuilding, bool hitWater) {
+    g_weaponVfxSeq += 131u;
+    Rng r(g_weaponVfxSeq ^ (uint32_t)(std::fabs(p.x * 7.0f + p.z * 19.0f) + 1.0f));
+
+    if (hitWater) {
+        int splashCnt = (int)clampf(scale * 2.2f, 18.0f, 85.0f);
+        for (int i = 0; i < splashCnt; i++) {
+            float a = r.range(0.0f, 2.0f * PI_F);
+            float hr = r.range(0.0f, scale * 0.42f);
+            SmokePoint sp;
+            sp.pos = p + Vec3(std::cos(a) * hr, r.range(0.2f, 1.5f), std::sin(a) * hr);
+            sp.vel = Vec3(std::cos(a) * r.range(2.0f, scale * 0.5f),
+                          r.range(scale * 0.55f, scale * 1.45f),
+                          std::sin(a) * r.range(2.0f, scale * 0.5f));
+            sp.maxLife = r.range(1.1f, 2.5f);
+            sp.life = sp.maxLife;
+            sp.r = r.range(0.84f, 0.96f);
+            sp.g = r.range(0.92f, 0.99f);
+            sp.b = 1.00f;
+            sp.size = r.range(scale * 0.16f, scale * 0.34f);
+            sp.growthRate = scale * 0.25f;
+            sp.ptype = PT_WATER_SPRAY;
+            pushParticle(sp);
+        }
+    } else {
+        ExplosionEffect ex;
+        ex.pos = p + surfNorm * 0.6f;
+        ex.surfNorm = surfNorm;
+        ex.age = 0.0f;
+        ex.maxAge = clampf(0.85f + scale * 0.028f, 0.75f, 1.9f);
+        ex.maxRadius = scale;
+        ex.hitBuilding = hitBuilding;
+        if (g_explosions.size() < 48) g_explosions.push_back(ex);
+
+        int flameCnt = (int)clampf(scale * 1.7f, 12.0f, 68.0f);
+        for (int i = 0; i < flameCnt; i++) {
+            float a = r.range(0.0f, 2.0f * PI_F);
+            float spRad = r.range(0.0f, scale * 0.36f);
+            SmokePoint sp;
+            sp.pos = p + Vec3(std::cos(a) * spRad, r.range(0.0f, scale * 0.22f), std::sin(a) * spRad)
+                   + surfNorm * r.range(0.2f, scale * 0.16f);
+            sp.vel = Vec3(std::cos(a) * r.range(2.0f, scale * 0.75f),
+                          r.range(4.0f, scale * 0.95f),
+                          std::sin(a) * r.range(2.0f, scale * 0.75f)) + surfNorm * (scale * 0.25f);
+            sp.maxLife = r.range(0.45f, 1.35f);
+            sp.life = sp.maxLife;
+            float hot = r.uni();
+            sp.r = 1.0f;
+            sp.g = lerpf(0.32f, 0.92f, hot);
+            sp.b = lerpf(0.04f, 0.42f, hot * hot);
+            sp.size = r.range(scale * 0.22f, scale * 0.48f);
+            sp.growthRate = scale * 0.28f;
+            sp.ptype = PT_FLAME;
+            pushParticle(sp);
+        }
+
+        int smokeCnt = (int)clampf(scale * 1.3f, 8.0f, 52.0f);
+        for (int i = 0; i < smokeCnt; i++) {
+            float a = r.range(0.0f, 2.0f * PI_F);
+            float spRad = r.range(0.0f, scale * 0.40f);
+            SmokePoint sp;
+            sp.pos = p + Vec3(std::cos(a) * spRad, r.range(0.5f, scale * 0.35f), std::sin(a) * spRad);
+            sp.vel = Vec3(std::cos(a) * r.range(1.5f, scale * 0.45f),
+                          r.range(5.0f, scale * 0.85f),
+                          std::sin(a) * r.range(1.5f, scale * 0.45f));
+            sp.maxLife = r.range(2.4f, 5.2f);
+            sp.life = sp.maxLife;
+            float soot = r.range(0.09f, 0.22f);
+            sp.r = soot; sp.g = soot; sp.b = soot + 0.02f;
+            sp.size = r.range(scale * 0.28f, scale * 0.56f);
+            sp.growthRate = scale * 0.24f;
+            sp.ptype = PT_BLACK_SMOKE;
+            pushParticle(sp);
+        }
+
+        int sparkCnt = (int)clampf(scale * 1.8f, 12.0f, 70.0f);
+        for (int i = 0; i < sparkCnt; i++) {
+            float a = r.range(0.0f, 2.0f * PI_F);
+            float spd = r.range(scale * 0.5f, scale * 2.1f);
+            SmokePoint sp;
+            sp.pos = p + surfNorm * 0.8f;
+            sp.vel = Vec3(std::cos(a) * spd, r.range(scale * 0.35f, scale * 1.65f), std::sin(a) * spd)
+                   + surfNorm * (scale * 0.35f);
+            sp.maxLife = r.range(0.75f, 2.1f);
+            sp.life = sp.maxLife;
+            sp.r = 1.0f;
+            sp.g = r.range(0.45f, 0.88f);
+            sp.b = r.range(0.08f, 0.28f);
+            sp.size = 4.2f;
+            sp.growthRate = 0.0f;
+            sp.ptype = PT_SPARK;
+            pushParticle(sp);
+        }
+    }
+
+    if (doShake) {
+        float camDist = len(p - g_lastCamEye);
+        float mag = clampf((scale * 0.085f) * (240.0f / (camDist + 85.0f)), 0.12f, 2.8f);
+        triggerCameraShake(mag, clampf(0.55f + scale * 0.024f, 0.55f, 1.65f));
+    }
+}
+
+static void spawnBombFireZone(const Vec3& impactPos, int hitBldgIdx) {
+    ActiveFireZone zone;
+    zone.center = impactPos;
+    zone.timeLeft = BOMB_FIRE_DURATION;
+    zone.maxDuration = BOMB_FIRE_DURATION;
+    zone.emitAccum = 0.0f;
+    zone.primaryBldgIdx = hitBldgIdx;
+
+    // Patlama yakinindaki tum binalari (OBB) topla ki ates gercek bina sekillerine ve kat seviyesine yayilsin
+    std::vector<int> affectedBldgs;
+    if (hitBldgIdx >= 0 && hitBldgIdx < (int)g_allBuildings.size()) {
+        affectedBldgs.push_back(hitBldgIdx);
+    }
+    float scanR = 30.0f;
+    int x0 = clampi((int)((impactPos.x - scanR - WORLD_X0) / SH_CELL), 0, SH_NX - 1);
+    int x1 = clampi((int)((impactPos.x + scanR - WORLD_X0) / SH_CELL), 0, SH_NX - 1);
+    int z0 = clampi((int)((impactPos.z - scanR - WORLD_Z0) / SH_CELL), 0, SH_NZ - 1);
+    int z1 = clampi((int)((impactPos.z + scanR - WORLD_Z0) / SH_CELL), 0, SH_NZ - 1);
+    for (int gz = z0; gz <= z1; gz++) {
+        for (int gx = x0; gx <= x1; gx++) {
+            for (int idx : g_spatialHash[gz * SH_NX + gx]) {
+                if ((int)affectedBldgs.size() >= 4) break;
+                bool dup = false;
+                for (int existing : affectedBldgs) if (existing == idx) { dup = true; break; }
+                if (dup) continue;
+                const BuildingInst& cand = g_allBuildings[idx];
+                float dx = impactPos.x - cand.x, dz = impactPos.z - cand.z;
+                float lx = dx * cand.cosY + dz * cand.sinY;
+                float lz = -dx * cand.sinY + dz * cand.cosY;
+                float cx = std::max(0.0f, std::fabs(lx) - cand.w * 0.5f);
+                float cz = std::max(0.0f, std::fabs(lz) - cand.d * 0.5f);
+                if (cx * cx + cz * cz <= 24.0f * 24.0f) {
+                    affectedBldgs.push_back(idx);
+                }
+            }
+        }
+    }
+
+    if (!affectedBldgs.empty()) {
+        if (zone.primaryBldgIdx < 0) zone.primaryBldgIdx = affectedBldgs[0];
+        float maxScale = 10.0f;
+        float maxSpanR = 14.0f;
+        Rng rng((uint32_t)(std::fabs(impactPos.x * 11.0f + impactPos.z * 29.0f) + 7.0f));
+
+        for (size_t bi = 0; bi < affectedBldgs.size(); bi++) {
+            const BuildingInst& b = g_allBuildings[affectedBldgs[bi]];
+            float bLevel = clampf(std::max(b.h * 0.65f, 0.55f * (b.w + b.d)), 7.5f, 34.0f);
+            if (bi == 0 || bLevel > maxScale) maxScale = bLevel;
+            float radFoot = 0.5f * std::sqrt(b.w * b.w + b.d * b.d);
+            maxSpanR = std::max(maxSpanR, radFoot + len(Vec3(b.x - impactPos.x, 0.0f, b.z - impactPos.z)));
+
+            float hw = std::max(2.0f, b.w * 0.5f);
+            float hd = std::max(2.0f, b.d * 0.5f);
+            float nodeScale = clampf(0.45f * std::min(b.w, b.d) + b.h * 0.16f, 4.2f, 15.0f);
+
+            // 1. Cati izgarasi (binanin gercek en/boy ve yonelim acisina tam uyan ates odaklar)
+            int nx = clampi((int)std::round(b.w / 6.8f), 2, 5);
+            int nz = clampi((int)std::round(b.d / 6.8f), 2, 5);
+            for (int ix = 0; ix < nx; ix++) {
+                float u = (nx == 1) ? 0.0f : (-0.78f + 1.56f * (float)ix / (float)(nx - 1));
+                for (int iz = 0; iz < nz; iz++) {
+                    float v = (nz == 1) ? 0.0f : (-0.78f + 1.56f * (float)iz / (float)(nz - 1));
+                    FireEmitterNode fn;
+                    fn.pos = bldgLocalToWorld(b, u * hw, b.h + 0.35f, v * hd);
+                    fn.outwardNorm = Vec3(0, 1, 0);
+                    fn.scale = nodeScale * rng.range(0.85f, 1.25f);
+                    fn.phase = rng.range(0.0f, 6.28f);
+                    fn.isRoof = true;
+                    zone.nodes.push_back(fn);
+                }
+            }
+
+            // 2. Cephe & pencere kat atesleri (yapi yuksekligine ve isabet katina gore 4 duvarda)
+            float hitLocalY = (bi == 0) ? clampf(impactPos.y - b.y, b.h * 0.25f, b.h - 1.5f)
+                                        : (b.h * 0.72f);
+            int sidePts = clampi((int)std::round(0.22f * std::max(b.w, b.d)), 2, 4);
+            int tierCnt = (b.h > 36.0f) ? 3 : 2;
+            for (int side = 0; side < 4; side++) {
+                float nlx = (side == 0) ? 1.0f : (side == 1 ? -1.0f : 0.0f);
+                float nlz = (side == 2) ? 1.0f : (side == 3 ? -1.0f : 0.0f);
+                Vec3 wNorm(nlx * b.cosY - nlz * b.sinY, 0.15f, nlx * b.sinY + nlz * b.cosY);
+                for (int sp = 0; sp < sidePts; sp++) {
+                    float tAlong = (sidePts == 1) ? 0.0f : (-0.70f + 1.40f * (float)sp / (float)(sidePts - 1));
+                    float lx = (nlx != 0.0f) ? (nlx * (hw + 0.65f)) : (tAlong * hw);
+                    float lz = (nlz != 0.0f) ? (nlz * (hd + 0.65f)) : (tAlong * hd);
+                    for (int tier = 0; tier < tierCnt; tier++) {
+                        float yOff = (tier == 0) ? hitLocalY
+                                                 : clampf(hitLocalY - tier * 5.2f, 2.0f, b.h - 2.0f);
+                        if (tier > 0 && std::fabs(yOff - hitLocalY) < 2.2f) continue;
+                        FireEmitterNode fn;
+                        fn.pos = bldgLocalToWorld(b, lx, yOff, lz);
+                        fn.outwardNorm = norm(wNorm);
+                        fn.scale = nodeScale * rng.range(0.68f, 1.05f);
+                        fn.phase = rng.range(0.0f, 6.28f);
+                        fn.isRoof = false;
+                        zone.nodes.push_back(fn);
+                    }
+                }
+            }
+        }
+        zone.radius = clampf(maxSpanR, 12.0f, 48.0f);
+        zone.buildingScale = maxScale;
+    } else {
+        // Acik arazi / Tepe uzerinde yere yapisan genis yangin cemberi
+        zone.radius = 18.0f;
+        zone.buildingScale = 14.0f;
+        Rng rng((uint32_t)(std::fabs(impactPos.x * 17.0f + impactPos.z * 31.0f) + 3.0f));
+        for (int i = 0; i < 18; i++) {
+            float a = (float)i * (2.0f * PI_F / 18.0f) + rng.range(-0.15f, 0.15f);
+            float rad = (i < 4) ? rng.range(0.0f, 4.5f) : rng.range(5.0f, 16.0f);
+            float gx = impactPos.x + std::cos(a) * rad;
+            float gz = impactPos.z + std::sin(a) * rad;
+            FireEmitterNode fn;
+            fn.pos = Vec3(gx, sampleTerrainElev(gx, gz) + 0.35f, gz);
+            fn.outwardNorm = Vec3(0, 1, 0);
+            fn.scale = rng.range(4.8f, 8.8f);
+            fn.phase = rng.range(0.0f, 6.28f);
+            fn.isRoof = true;
+            zone.nodes.push_back(fn);
+        }
+    }
+
+    if (g_activeFires.size() >= MAX_ACTIVE_FIRES) {
+        g_activeFires.erase(g_activeFires.begin());
+    }
+    g_activeFires.push_back(std::move(zone));
+}
+
+static void computeWeaponAiming() {
+    if (g_ac.crashed) {
+        g_gunAimValid = false;
+        g_ccipValid = false;
+        return;
+    }
+    // 1. Mermi / Top Nisangahi (Boresight ray trace - tam bina OBB + arazi)
+    Vec3 gunOrigin = g_ac.pos + g_ac.fwd * 4.5f;
+    Vec3 dummyNorm;
+    int hitB = -1;
+    bool hitW = false;
+    bool hit = traceWeaponRay(gunOrigin, norm(g_ac.fwd), 2000.0f, 0.6f,
+                              g_gunAimPos, dummyNorm, hitB, hitW);
+    g_gunAimValid = true;
+    g_gunAimHitBldg = (hit && hitB >= 0);
+    g_gunAimDist = len(g_gunAimPos - gunOrigin);
+
+    // 2. Bomba CCIP (Surekli Hesaplanan Vurus Noktasi - gercek yercekimi ve bina fizigiyle)
+    Vec3 bPos = g_ac.pos - g_ac.up * 1.4f + g_ac.fwd * 1.2f;
+    Vec3 bVel = g_ac.vel + g_ac.fwd * 4.0f - g_ac.up * 3.0f;
+    const float simDt = 0.08f;
+    g_ccipValid = false;
+    g_ccipHitBldg = false;
+    g_ccipHitBldgIdx = -1;
+    for (int step = 0; step < 120; step++) {
+        Vec3 nextVel = bVel + Vec3(0.0f, -9.80665f, 0.0f) * simDt;
+        nextVel -= nextVel * (0.0012f * len(nextVel) * simDt);
+        Vec3 nextPos = bPos + (bVel + nextVel) * (0.5f * simDt);
+        Vec3 hitPos, hitN;
+        int bIdx = -1;
+        bool wHit = false;
+        if (traceWeaponSegment(bPos, nextPos, 1.2f, hitPos, hitN, bIdx, wHit)) {
+            g_ccipValid = true;
+            g_ccipPos = hitPos;
+            g_ccipNorm = hitN;
+            g_ccipHitBldgIdx = bIdx;
+            g_ccipHitBldg = (bIdx >= 0);
+            g_ccipFallTime = (step + 1) * simDt;
+            break;
+        }
+        bPos = nextPos;
+        bVel = nextVel;
+        if (bPos.y < -20.0f) break;
+    }
+}
+
+static void fireBulletStream() {
+    if (g_ac.crashed) return;
+    g_gunBarrelToggle = !g_gunBarrelToggle;
+    float sideOff = g_gunBarrelToggle ? 0.95f : -0.95f;
+    Vec3 muzzle = g_ac.pos + g_ac.fwd * 4.6f + g_ac.right * sideOff - g_ac.up * 0.25f;
+    Vec3 dir = norm(g_ac.fwd);
+    BulletProj bp;
+    bp.pos = muzzle;
+    bp.prevPos = muzzle - dir * 2.5f;
+    bp.vel = g_ac.vel + dir * 740.0f;
+    bp.life = 2.6f;
+    g_bullets.push_back(bp);
+
+    // Hafif namlu ates/duman parlama partikulu ve mikro titresim
+    SmokePoint flash;
+    flash.pos = muzzle + dir * 1.2f;
+    flash.vel = g_ac.vel + dir * 25.0f;
+    flash.maxLife = 0.09f;
+    flash.life = 0.09f;
+    flash.r = 1.0f; flash.g = 0.85f; flash.b = 0.35f;
+    flash.size = 1.6f;
+    flash.growthRate = 3.0f;
+    flash.ptype = PT_FLAME;
+    pushParticle(flash);
+    if (g_camShakeTimer < 0.06f) triggerCameraShake(0.06f, 0.07f);
+}
+
+static void dropBomb() {
+    if (g_ac.crashed) return;
+    BombProj bm;
+    bm.pos = g_ac.pos - g_ac.up * 1.4f + g_ac.fwd * 1.2f;
+    bm.prevPos = bm.pos;
+    bm.vel = g_ac.vel + g_ac.fwd * 4.0f - g_ac.up * 3.0f;
+    bm.life = 14.0f;
+    bm.trailAccum = 0.0f;
+    g_bombs.push_back(bm);
+    triggerCameraShake(0.18f, 0.14f);
+}
+
+static void updateWeaponsAndFires(float dt) {
+    if (g_gunFireCd > 0.0f) g_gunFireCd = std::max(0.0f, g_gunFireCd - dt);
+    if (g_bombDropCd > 0.0f) g_bombDropCd = std::max(0.0f, g_bombDropCd - dt);
+
+    // Mermiler (swept bina OBB + arazi/deniz carpismasi)
+    for (size_t i = 0; i < g_bullets.size();) {
+        BulletProj& b = g_bullets[i];
+        b.life -= dt;
+        b.prevPos = b.pos;
+        b.vel.y -= 4.5f * dt;
+        b.pos += b.vel * dt;
+        Vec3 hitPos, hitN;
+        int bIdx = -1;
+        bool hitWater = false;
+        if (traceWeaponSegment(b.prevPos, b.pos, 0.65f, hitPos, hitN, bIdx, hitWater)) {
+            spawnExplosionAt(hitPos, hitN, bIdx >= 0 ? 7.2f : 5.2f, false, (bIdx >= 0), hitWater);
+            g_bullets[i] = g_bullets.back();
+            g_bullets.pop_back();
+            continue;
+        }
+        if (b.life <= 0.0f || b.pos.y < -15.0f) {
+            g_bullets[i] = g_bullets.back();
+            g_bullets.pop_back();
+        } else {
+            i++;
+        }
+    }
+
+    // Bombalar (gercek yercekimi + surukleme + swept bina OBB fizigi)
+    for (size_t i = 0; i < g_bombs.size();) {
+        BombProj& bm = g_bombs[i];
+        bm.life -= dt;
+        bm.prevPos = bm.pos;
+        Vec3 nextVel = bm.vel + Vec3(0.0f, -9.80665f, 0.0f) * dt;
+        nextVel -= nextVel * (0.0012f * len(nextVel) * dt);
+        bm.pos += (bm.vel + nextVel) * (0.5f * dt);
+        bm.vel = nextVel;
+
+        bm.trailAccum += dt;
+        if (bm.trailAccum >= 0.035f) {
+            bm.trailAccum = 0.0f;
+            SmokePoint sp;
+            sp.pos = bm.pos;
+            sp.vel = Vec3(0, 0.6f, 0);
+            sp.maxLife = 0.65f;
+            sp.life = 0.65f;
+            sp.r = 0.85f; sp.g = 0.86f; sp.b = 0.88f;
+            sp.size = 1.2f;
+            sp.growthRate = 1.8f;
+            sp.ptype = PT_BLACK_SMOKE;
+            pushParticle(sp);
+        }
+
+        Vec3 hitPos, hitN;
+        int bIdx = -1;
+        bool hitWater = false;
+        if (traceWeaponSegment(bm.prevPos, bm.pos, 1.2f, hitPos, hitN, bIdx, hitWater)) {
+            float expScale = 34.0f;
+            if (bIdx >= 0 && bIdx < (int)g_allBuildings.size()) {
+                const BuildingInst& hb = g_allBuildings[bIdx];
+                expScale = clampf(std::max(hb.h * 0.65f, 0.5f * (hb.w + hb.d)) + 16.0f, 24.0f, 52.0f);
+            }
+            spawnExplosionAt(hitPos, hitN, expScale, true, (bIdx >= 0), hitWater);
+            if (!hitWater) {
+                spawnBombFireZone(hitPos, bIdx);
+            }
+            g_bombs[i] = g_bombs.back();
+            g_bombs.pop_back();
+            continue;
+        }
+        if (bm.life <= 0.0f || bm.pos.y < -20.0f) {
+            g_bombs[i] = g_bombs.back();
+            g_bombs.pop_back();
+        } else {
+            i++;
+        }
+    }
+
+    // Patlama sok dalgasi zamanlayicilari
+    for (size_t i = 0; i < g_explosions.size();) {
+        g_explosions[i].age += dt;
+        if (g_explosions[i].age >= g_explosions[i].maxAge) {
+            g_explosions[i] = g_explosions.back();
+            g_explosions.pop_back();
+        } else {
+            i++;
+        }
+    }
+
+    // 30 saniyelik bina sekline dagilan yanginlar
+    for (size_t i = 0; i < g_activeFires.size();) {
+        ActiveFireZone& z = g_activeFires[i];
+        z.timeLeft -= dt;
+        if (z.timeLeft <= 0.0f) {
+            g_activeFires[i] = g_activeFires.back();
+            g_activeFires.pop_back();
+            continue;
+        }
+        float lifeFrac = clampf(z.timeLeft / std::max(1.0f, z.maxDuration), 0.0f, 1.0f);
+        float intensity = (lifeFrac > 0.14f) ? 1.0f : (lifeFrac / 0.14f);
+        z.emitAccum += dt;
+        if (z.emitAccum >= 0.075f && !z.nodes.empty()) {
+            z.emitAccum = 0.0f;
+            g_weaponVfxSeq += 37u;
+            Rng r(g_weaponVfxSeq + (uint32_t)(i * 97));
+            int bursts = clampi((int)z.nodes.size() / 4, 2, 7);
+            for (int b = 0; b < bursts; b++) {
+                const FireEmitterNode& fn = z.nodes[(size_t)r.range(0.0f, (float)z.nodes.size() - 0.01f)];
+                float s = fn.scale * (0.45f + 0.55f * intensity);
+
+                SmokePoint fl;
+                fl.pos = fn.pos + Vec3(r.range(-1.2f, 1.2f), r.range(0.2f, s * 0.35f), r.range(-1.2f, 1.2f));
+                fl.vel = fn.outwardNorm * r.range(0.8f, 3.2f)
+                       + Vec3(r.range(-1.8f, 1.8f), r.range(4.5f, 4.5f + s * 1.15f), r.range(-1.8f, 1.8f));
+                fl.maxLife = r.range(0.45f, 0.95f);
+                fl.life = fl.maxLife;
+                fl.r = 1.0f;
+                fl.g = r.range(0.35f, 0.85f);
+                fl.b = r.range(0.04f, 0.20f);
+                fl.size = r.range(s * 0.42f, s * 0.78f);
+                fl.growthRate = s * 0.35f;
+                fl.ptype = PT_FLAME;
+                pushParticle(fl);
+
+                if (b % 2 == 0) {
+                    SmokePoint sm;
+                    sm.pos = fn.pos + Vec3(r.range(-1.5f, 1.5f), s * 0.55f, r.range(-1.5f, 1.5f));
+                    sm.vel = Vec3(r.range(-1.6f, 1.6f), r.range(5.5f, 9.5f + s * 0.75f), r.range(-1.6f, 1.6f));
+                    sm.maxLife = r.range(2.2f, 4.4f);
+                    sm.life = sm.maxLife;
+                    float soot = r.range(0.10f, 0.22f);
+                    sm.r = soot; sm.g = soot; sm.b = soot + 0.01f;
+                    sm.size = r.range(s * 0.52f, s * 0.95f);
+                    sm.growthRate = s * 0.45f;
+                    sm.ptype = PT_BLACK_SMOKE;
+                    pushParticle(sm);
+                }
+            }
+        }
+        i++;
+    }
+}
+
+static inline void drawBillboardQuad3D(const Vec3& c, const Vec3& rVec, const Vec3& uVec, float halfSz) {
+    Vec3 rx = rVec * halfSz;
+    Vec3 uy = uVec * halfSz;
+    glTexCoord2f(0.0f, 0.0f); glVertex3f(c.x - rx.x - uy.x, c.y - rx.y - uy.y, c.z - rx.z - uy.z);
+    glTexCoord2f(1.0f, 0.0f); glVertex3f(c.x + rx.x - uy.x, c.y + rx.y - uy.y, c.z + rx.z - uy.z);
+    glTexCoord2f(1.0f, 1.0f); glVertex3f(c.x + rx.x + uy.x, c.y + rx.y + uy.y, c.z + rx.z + uy.z);
+    glTexCoord2f(0.0f, 1.0f); glVertex3f(c.x - rx.x + uy.x, c.y - rx.y + uy.y, c.z - rx.z + uy.z);
+}
+
+static void renderExplosions3D(const Vec3& camRight, const Vec3& camUp) {
+    if (g_explosions.empty()) return;
+    bool hadFog = (glIsEnabled(GL_FOG) != GL_FALSE);
+    glDisable(GL_FOG);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_LIGHTING);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, g_texParticle);
+
+    glBegin(GL_QUADS);
+    for (const auto& ex : g_explosions) {
+        float t = clampf(ex.age / ex.maxAge, 0.0f, 1.0f);
+        float coreSz = ex.maxRadius * (0.28f + 0.95f * std::sqrt(t));
+        float glowA = (1.0f - t) * (1.0f - t);
+        if (t < 0.35f) {
+            float flashA = 1.0f - (t / 0.35f);
+            glColor4f(1.0f * flashA, 0.96f * flashA, 0.78f * flashA, 1.0f);
+            drawBillboardQuad3D(ex.pos, camRight, camUp, coreSz * 0.85f);
+        }
+        glColor4f(1.0f * glowA, 0.46f * glowA, 0.08f * glowA, 1.0f);
+        drawBillboardQuad3D(ex.pos + Vec3(0.0f, coreSz * 0.25f, 0.0f), camRight, camUp, coreSz * 1.35f);
+    }
+    glEnd();
+
+    // Genisleyen 3D yer/cephe sok dalgasi halkasi
+    glDisable(GL_TEXTURE_2D);
+    for (const auto& ex : g_explosions) {
+        float t = clampf(ex.age / ex.maxAge, 0.0f, 1.0f);
+        if (t > 0.72f) continue;
+        float rOuter = ex.maxRadius * (0.25f + 1.95f * t);
+        float rInner = rOuter * 0.72f;
+        float a = (1.0f - t / 0.72f) * 0.85f;
+        Vec3 n = norm(ex.surfNorm);
+        Vec3 ref = (std::fabs(n.y) < 0.85f) ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
+        Vec3 u = norm(cross(ref, n));
+        Vec3 v = norm(cross(n, u));
+        glBegin(GL_QUAD_STRIP);
+        for (int s = 0; s <= 24; s++) {
+            float ang = (float)s * (2.0f * PI_F / 24.0f);
+            Vec3 rad = u * std::cos(ang) + v * std::sin(ang);
+            Vec3 pi = ex.pos + rad * rInner;
+            Vec3 po = ex.pos + rad * rOuter;
+            glColor4f(1.0f * a, 0.62f * a, 0.16f * a, a);
+            glVertex3f(pi.x, pi.y, pi.z);
+            glColor4f(0.25f * a, 0.06f * a, 0.0f, 0.0f);
+            glVertex3f(po.x, po.y, po.z);
+        }
+        glEnd();
+    }
+
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_LIGHTING);
+    if (hadFog) glEnable(GL_FOG);
+}
+
+static void renderWeaponsAndFires3D(float simTime, const Vec3& camRight, const Vec3& camUp, const Vec3& camEye) {
+    // 1. CCIP 3D hedef halkasi (yuzeye yerlesik, bomba dusus noktasi gostergesi)
+    if (g_ccipValid && !g_ac.crashed) {
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_LIGHTING);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_TEXTURE_2D);
+        float pulse = 0.72f + 0.28f * std::sin(simTime * 7.0f);
+        Vec3 n = norm(g_ccipNorm);
+        Vec3 ref = (std::fabs(n.y) < 0.85f) ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
+        Vec3 u = norm(cross(ref, n));
+        Vec3 v = norm(cross(n, u));
+        Vec3 c = g_ccipPos + n * 0.55f;
+        float ringR = clampf(len(c - camEye) * 0.015f, 4.5f, 22.0f);
+        glLineWidth(2.2f);
+        glBegin(GL_LINE_LOOP);
+        glColor4f(g_ccipHitBldg ? 1.0f : 1.0f, g_ccipHitBldg ? 0.24f : 0.78f, g_ccipHitBldg ? 0.15f : 0.18f, 0.85f * pulse);
+        for (int s = 0; s < 24; s++) {
+            float a = (float)s * (2.0f * PI_F / 24.0f);
+            Vec3 p = c + (u * std::cos(a) + v * std::sin(a)) * ringR;
+            glVertex3f(p.x, p.y, p.z);
+        }
+        glEnd();
+        glBegin(GL_LINES);
+        glVertex3f(c.x - u.x * ringR * 1.3f, c.y - u.y * ringR * 1.3f, c.z - u.z * ringR * 1.3f);
+        glVertex3f(c.x + u.x * ringR * 1.3f, c.y + u.y * ringR * 1.3f, c.z + u.z * ringR * 1.3f);
+        glVertex3f(c.x - v.x * ringR * 1.3f, c.y - v.y * ringR * 1.3f, c.z - v.z * ringR * 1.3f);
+        glVertex3f(c.x + v.x * ringR * 1.3f, c.y + v.y * ringR * 1.3f, c.z + v.z * ringR * 1.3f);
+        glEnd();
+        glLineWidth(1.0f);
+        glDisable(GL_BLEND);
+        glEnable(GL_LIGHTING);
+    }
+
+    // 2. Ucaktan ateslenen Tracer Mermiler
+    if (!g_bullets.empty()) {
+        glDisable(GL_LIGHTING);
+        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE);
+        glLineWidth(2.6f);
+        glBegin(GL_LINES);
+        for (const auto& b : g_bullets) {
+            Vec3 dir = norm(b.vel);
+            Vec3 tail = b.pos - dir * 16.0f;
+            glColor3f(1.0f, 0.92f, 0.55f);
+            glVertex3f(b.pos.x, b.pos.y, b.pos.z);
+            glColor3f(1.0f, 0.36f, 0.05f);
+            glVertex3f(tail.x, tail.y, tail.z);
+        }
+        glEnd();
+        glLineWidth(1.0f);
+        glDisable(GL_BLEND);
+        glEnable(GL_LIGHTING);
+    }
+
+    // 3. Havadaki 3D Aerodinamik Bombalar (kuyruk kanatcikli)
+    if (!g_bombs.empty()) {
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_LIGHTING);
+        for (const auto& bm : g_bombs) {
+            Vec3 f = (len(bm.vel) > 1.0f) ? norm(bm.vel) : Vec3(0, -1, 0);
+            Vec3 r = norm(cross(f, std::fabs(f.y) < 0.9f ? Vec3(0, 1, 0) : Vec3(1, 0, 0)));
+            Vec3 u = norm(cross(r, f));
+            glPushMatrix();
+            float m[16] = {
+                r.x, r.y, r.z, 0.0f,
+                u.x, u.y, u.z, 0.0f,
+                f.x, f.y, f.z, 0.0f,
+                bm.pos.x, bm.pos.y, bm.pos.z, 1.0f
+            };
+            glMultMatrixf(m);
+            glBegin(GL_QUADS);
+            glColor3f(0.18f, 0.22f, 0.16f);
+            // Govde ve konik burun + sari halka
+            emitBoxFaces(0.0f, 0.0f, 0.0f, 0.42f, 0.42f, 1.85f, 1, 1, 1, 1);
+            glColor3f(0.95f, 0.78f, 0.12f);
+            emitBoxFaces(0.0f, 0.0f, 0.72f, 0.44f, 0.44f, 0.28f, 1, 1, 1, 1);
+            glColor3f(0.14f, 0.16f, 0.14f);
+            emitBoxFaces(0.0f, 0.0f, 1.25f, 0.28f, 0.28f, 0.52f, 1, 1, 1, 1);
+            emitBoxFaces(0.0f, 0.0f, -1.15f, 0.95f, 0.08f, 0.45f, 1, 1, 1, 1);
+            emitBoxFaces(0.0f, 0.0f, -1.15f, 0.08f, 0.95f, 0.45f, 1, 1, 1, 1);
+            glEnd();
+            glPopMatrix();
+        }
+    }
+
+    // 4. 30 Saniyelik Bina Sekline Dagilmis Aktif Alev Perdeleri (additive sprite billboardlari)
+    if (!g_activeFires.empty()) {
+        bool hadFog = (glIsEnabled(GL_FOG) != GL_FALSE);
+        glDisable(GL_FOG);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_LIGHTING);
+        glDepthMask(GL_FALSE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, g_texParticle);
+
+        glBegin(GL_QUADS);
+        for (const auto& z : g_activeFires) {
+            if (len(z.center - camEye) > 15000.0f) continue;
+            float lifeFrac = clampf(z.timeLeft / std::max(1.0f, z.maxDuration), 0.0f, 1.0f);
+            float intensity = (lifeFrac > 0.14f) ? 1.0f : (lifeFrac / 0.14f);
+            for (const auto& fn : z.nodes) {
+                float flick = 0.78f + 0.28f * std::sin(simTime * 13.5f + fn.phase)
+                                    + 0.14f * std::cos(simTime * 21.0f + fn.phase * 1.7f);
+                float sz = fn.scale * intensity * clampf(flick, 0.55f, 1.25f);
+                if (sz < 0.8f) continue;
+                Vec3 flamePos = fn.pos + Vec3(0.0f, sz * 0.52f, 0.0f) + fn.outwardNorm * (fn.isRoof ? 0.0f : 0.45f);
+                glColor4f(1.0f * intensity, 0.44f * intensity, 0.06f * intensity, 1.0f);
+                drawBillboardQuad3D(flamePos, camRight, camUp, sz * 0.92f);
+                // Icteki parlak sari-beyaz cekirdek
+                glColor4f(1.0f * intensity, 0.88f * intensity, 0.34f * intensity, 1.0f);
+                drawBillboardQuad3D(fn.pos + Vec3(0.0f, sz * 0.28f, 0.0f), camRight, camUp, sz * 0.48f);
+            }
+        }
+        glEnd();
+
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_LIGHTING);
+        if (hadFog) glEnable(GL_FOG);
+    }
+}
+
+static void precompileNearChunks(const Vec3& focusPos, float radius);
 
 // Gram-Schmidt ortonormalizasyon (Gimbal Lock'suz 6-DOF yonelim matrisi)
 static void orthonormalizeBasis(Vec3& r, Vec3& u, Vec3& f) {
@@ -5080,6 +6912,8 @@ static void drawLoftedFuselage(const LoftSec* secs, int nSec, int segsAround,
         const LoftSec& s0 = secs[i];
         const LoftSec& s1 = secs[i + 1];
         bool isCanopySeg = (i >= canopyStart && i < canopyEnd);
+        float dz = std::max(0.05f, s0.z - s1.z);
+        float drAvg = 0.5f * ((s1.rx - s0.rx) + (s1.ry - s0.ry)) / dz;
         glBegin(GL_QUAD_STRIP);
         for (int j = 0; j <= M; j++) {
             float ang = (float)j / (float)M * 2.0f * PI_F;
@@ -5091,14 +6925,13 @@ static void drawLoftedFuselage(const LoftSec* secs, int nSec, int segsAround,
             };
             Vec3 p0 = evalPt(s0);
             Vec3 p1 = evalPt(s1);
-            Vec3 n = norm(Vec3(ca, sa * 0.85f, (s0.rx - s1.rx) * 0.25f));
+            Vec3 n = norm(Vec3(ca, sa * 0.90f, drAvg));
             glNormal3f(n.x, n.y, n.z);
 
             if (isCanopySeg && sa > 0.25f) {
-                // Seffaf/parlak kokpit kanopisi
-                glColor3f(0.22f, 0.55f, 0.86f);
+                float tint = 0.75f + 0.25f * sa;
+                glColor3f(0.10f * tint, 0.28f * tint, 0.52f * tint);
             } else if (std::fabs(sa) < 0.22f) {
-                // Yanal kirmizi/altin akrobasi seridi
                 glColor3f(rAccent, gAccent, bAccent);
             } else {
                 glColor3f(rBody, gBody, bBody);
@@ -5110,7 +6943,33 @@ static void drawLoftedFuselage(const LoftSec* secs, int nSec, int segsAround,
     }
 }
 
-// 3 Noktali Oleo-Pnomatik Inis Takimi Cizimi
+static void drawWheelCylinder3D(float cx, float cy, float cz, float rad, float halfW) {
+    const int segs = 12;
+    glBegin(GL_QUAD_STRIP);
+    for (int i = 0; i <= segs; i++) {
+        float a = (float)i / (float)segs * 2.0f * PI_F;
+        float ca = std::cos(a), sa = std::sin(a);
+        glNormal3f(0.0f, sa, ca);
+        glColor3f(0.12f, 0.13f, 0.14f);
+        glVertex3f(cx - halfW, cy + sa * rad, cz + ca * rad);
+        glVertex3f(cx + halfW, cy + sa * rad, cz + ca * rad);
+    }
+    glEnd();
+    for (int side = -1; side <= 1; side += 2) {
+        glBegin(GL_TRIANGLE_FAN);
+        glNormal3f((float)side, 0.0f, 0.0f);
+        glColor3f(0.76f, 0.79f, 0.84f);
+        glVertex3f(cx + side * halfW, cy, cz);
+        for (int i = 0; i <= segs; i++) {
+            float a = (float)i / (float)segs * 2.0f * PI_F;
+            glColor3f(0.14f, 0.15f, 0.16f);
+            glVertex3f(cx + side * halfW, cy + std::sin(a) * rad, cz + std::cos(a) * rad);
+        }
+        glEnd();
+    }
+}
+
+// 3 Noktali Oleo-Pnomatik Inis Takimi Cizimi (3D silindirik lastikler ve jantlar)
 static void drawLandingGear3D(float gearAnim, const float wheelDeflect[3], float wingSpan) {
     if (gearAnim <= 0.02f) return;
     glDisable(GL_TEXTURE_2D);
@@ -5125,21 +6984,57 @@ static void drawLandingGear3D(float gearAnim, const float wheelDeflect[3], float
         float strutLen = (1.13f - clampf(wheelDeflect[w], 0.0f, 0.45f)) * ext;
         Vec3 top = mounts[w];
         Vec3 bot = top - Vec3(0.0f, strutLen, 0.0f);
-        // Oleo amortisor dikmesi
-        glColor3f(0.78f, 0.82f, 0.86f);
+        glColor3f(0.80f, 0.84f, 0.88f);
         glBegin(GL_QUADS);
-        emitBoxFaces(top.x, bot.y, top.z, 0.12f, 0.12f, strutLen, 1, 0, 1, 1);
-        // Siyah kauçuk tekerlek
-        glColor3f(0.14f, 0.15f, 0.16f);
-        emitBoxFaces(bot.x, bot.y - 0.26f, bot.z, 0.24f, 0.55f, 0.52f, 1, 0, 1, 1);
+        emitBoxFaces(top.x, bot.y, top.z, 0.11f, 0.11f, strutLen, 1, 0, 1, 1);
         glEnd();
+        drawWheelCylinder3D(bot.x, bot.y - 0.14f, bot.z, (w == 0) ? 0.22f : 0.27f, 0.10f);
     }
 }
 
-// 3 Detayli Kesit Orgulu (Lofted) Ucak Modeli Render
+// Simetrik Tapered Airfoil Stabilizer / Kanat Panel Yardimcisi
+static void emitTaperedAirfoilPair(float x0, float y0, float z0F, float z0B, float t0,
+                                   float x1, float y1, float z1F, float z1B, float t1,
+                                   float rCol, float gCol, float bCol) {
+    for (int side = -1; side <= 1; side += 2) {
+        float s = (float)side;
+        float rx0 = s * x0, rx1 = s * x1;
+        glColor3f(rCol, gCol, bCol);
+        glNormal3f(0.0f, 1.0f, 0.0f);
+        glVertex3f(rx0, y0 + t0 * 0.5f, z0F);
+        glVertex3f(rx1, y1 + t1 * 0.5f, z1F);
+        glVertex3f(rx1, y1 + t1 * 0.5f, z1B);
+        glVertex3f(rx0, y0 + t0 * 0.5f, z0B);
+
+        glNormal3f(0.0f, -1.0f, 0.0f);
+        glVertex3f(rx0, y0 - t0 * 0.5f, z0F);
+        glVertex3f(rx0, y0 - t0 * 0.5f, z0B);
+        glVertex3f(rx1, y1 - t1 * 0.5f, z1B);
+        glVertex3f(rx1, y1 - t1 * 0.5f, z1F);
+
+        glNormal3f(0.0f, 0.15f, 0.98f);
+        glVertex3f(rx0, y0 - t0 * 0.5f, z0F);
+        glVertex3f(rx1, y1 - t1 * 0.5f, z1F);
+        glVertex3f(rx1, y1 + t1 * 0.5f, z1F);
+        glVertex3f(rx0, y0 + t0 * 0.5f, z0F);
+
+        glNormal3f(0.0f, 0.0f, -1.0f);
+        glVertex3f(rx0, y0 - t0 * 0.5f, z0B);
+        glVertex3f(rx0, y0 + t0 * 0.5f, z0B);
+        glVertex3f(rx1, y1 + t1 * 0.5f, z1B);
+        glVertex3f(rx1, y1 - t1 * 0.5f, z1B);
+
+        glNormal3f(s, 0.0f, 0.0f);
+        glVertex3f(rx1, y1 - t1 * 0.5f, z1F);
+        glVertex3f(rx1, y1 - t1 * 0.5f, z1B);
+        glVertex3f(rx1, y1 + t1 * 0.5f, z1B);
+        glVertex3f(rx1, y1 + t1 * 0.5f, z1F);
+    }
+}
+
+// 3 Detayli Kesit Orgulu (Lofted) + Parlak Kompozit/Metal Spekularli Ucak Modeli Render
 static void renderAircraftModel(const AircraftState& ac, float simTime) {
     glPushMatrix();
-    // Gram-Schmidt bazindan 4x4 OpenGL model matrisi (+Z = fwd, +Y = up, +X = right)
     float m[16] = {
         ac.right.x, ac.right.y, ac.right.z, 0.0f,
         ac.up.x,    ac.up.y,    ac.up.z,    0.0f,
@@ -5149,35 +7044,40 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
     glMultMatrixf(m);
     glDisable(GL_TEXTURE_2D);
 
+    // Ucakta parlak metalik/kompozit gunes yansimasi (specular highlight)
+    float acSpec[4] = {0.85f, 0.88f, 0.94f, 1.0f};
+    glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, acSpec);
+    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 64.0f);
+
     float aileronAng = ac.rollInput * 22.0f * DEG2RAD;
     float elevAng    = ac.pitchInput * 20.0f * DEG2RAD;
     float rudderAng  = ac.yawInput * 24.0f * DEG2RAD;
     float flapAng    = ac.flapDeg * DEG2RAD;
 
     if (ac.type == AC_JET) {
-        // 1. TURK YILDIZLARI / SOLOTURK SUPERSONIK JET (14 enine kesitli lofted govde)
+        // 1. TURK YILDIZLARI / SOLOTURK SUPERSONIK JET (26 segmentli parlak govde + LERX + kanat ucu fuzeleri)
         static const LoftSec jetSecs[14] = {
-            { 7.80f, 0.03f, 0.03f, -0.10f, 1.0f}, // Pitot ucu
-            { 6.80f, 0.24f, 0.22f, -0.08f, 1.0f}, // Radom burun
+            { 7.80f, 0.03f, 0.03f, -0.10f, 1.0f},
+            { 6.80f, 0.24f, 0.22f, -0.08f, 1.0f},
             { 5.40f, 0.52f, 0.48f, -0.04f, 1.1f},
-            { 4.10f, 0.68f, 0.62f,  0.04f, 1.55f}, // Kokpit on kanopi
-            { 2.60f, 0.74f, 0.68f,  0.08f, 1.75f}, // Kokpit tepe
-            { 1.10f, 0.82f, 0.66f,  0.04f, 1.35f}, // Kanopi arka
-            {-0.20f, 1.08f, 0.68f,  0.00f, 1.10f}, // Hava aliklari (intakes)
-            {-1.80f, 1.15f, 0.70f,  0.00f, 1.05f}, // Orta govde / LERX
+            { 4.10f, 0.68f, 0.62f,  0.04f, 1.55f},
+            { 2.60f, 0.74f, 0.68f,  0.08f, 1.78f},
+            { 1.10f, 0.82f, 0.66f,  0.04f, 1.35f},
+            {-0.20f, 1.08f, 0.68f,  0.00f, 1.10f},
+            {-1.80f, 1.15f, 0.70f,  0.00f, 1.05f},
             {-3.40f, 1.10f, 0.68f,  0.00f, 1.05f},
             {-4.80f, 0.98f, 0.64f,  0.00f, 1.02f},
             {-6.00f, 0.84f, 0.58f,  0.00f, 1.00f},
             {-6.80f, 0.68f, 0.52f,  0.00f, 1.00f},
-            {-7.35f, 0.54f, 0.48f,  0.00f, 1.00f}, // Egzoz nozulu dis
-            {-7.65f, 0.44f, 0.42f,  0.00f, 1.00f}  // Egzoz cikisi
+            {-7.35f, 0.54f, 0.48f,  0.00f, 1.00f},
+            {-7.65f, 0.44f, 0.42f,  0.00f, 1.00f}
         };
-        drawLoftedFuselage(jetSecs, 14, 18, 3, 6, 0.95f, 0.96f, 0.98f, 0.88f, 0.12f, 0.14f);
+        drawLoftedFuselage(jetSecs, 14, 24, 3, 6, 0.95f, 0.96f, 0.98f, 0.88f, 0.12f, 0.14f);
 
-        // Arka Titan Egzoz Nozulu Halkasi ve Kapali Turbin Diski (govde icinin bos gorunmesini %100 onler)
+        // Arka Titan Egzoz Nozulu Halkasi ve Kapali Turbin Diski
         glBegin(GL_QUAD_STRIP);
-        for (int j = 0; j <= 18; j++) {
-            float a = (float)j / 18.0f * 2.0f * PI_F;
+        for (int j = 0; j <= 20; j++) {
+            float a = (float)j / 20.0f * 2.0f * PI_F;
             float ca = std::cos(a), sa = std::sin(a);
             glNormal3f(ca, sa, -0.25f);
             glColor3f(0.24f, 0.25f, 0.28f);
@@ -5191,172 +7091,128 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
         float glow = clampf(ac.throttle, 0.15f, 1.0f);
         glColor3f(0.35f + 0.65f * glow, 0.22f + 0.45f * glow, 0.14f + 0.20f * glow);
         glVertex3f(0.0f, 0.0f, -7.67f);
-        for (int j = 0; j <= 18; j++) {
-            float a = (float)j / 18.0f * 2.0f * PI_F;
+        for (int j = 0; j <= 20; j++) {
+            float a = (float)j / 20.0f * 2.0f * PI_F;
             glColor3f(0.12f, 0.13f, 0.15f);
             glVertex3f(std::cos(a) * 0.43f, std::sin(a) * 0.41f, -7.67f);
         }
         glEnd();
 
-        // Delta-trapez 3D ana kanatlar + ikiz yan hava aliklari + 3D hacimsel dikey kuyruk (Turk Yildizlari deseni)
+        // Govde alti merkez harici yakit tanki + LERX + Kanatlar + Dikey kuyruk
         glBegin(GL_QUADS);
+        glColor3f(0.92f, 0.93f, 0.96f);
+        emitBoxFaces(0.0f, -0.58f, -1.35f, 0.44f, 3.80f, 0.42f, 1, 0, 1, 1);
         for (int side = -1; side <= 1; side += 2) {
             float s = (float)side;
-            // Ikiz yan motor hava aliklari (side intakes)
             glColor3f(0.92f, 0.93f, 0.96f);
             emitBoxFaces(s * 0.88f, -0.22f, -0.80f, 0.42f, 2.80f, 0.48f, 1, 0, 1, 1);
-            // Hava aligi karanlik giris agzi
             glNormal3f(0.0f, 0.0f, 1.0f);
             glColor3f(0.10f, 0.12f, 0.15f);
-            glVertex3f(s * 0.68f, -0.20f, 0.62f);
-            glVertex3f(s * 1.08f, -0.20f, 0.62f);
-            glVertex3f(s * 1.08f,  0.24f, 0.62f);
-            glVertex3f(s * 0.68f,  0.24f, 0.62f);
+            glVertex3f(s * 0.68f, -0.20f, 0.62f); glVertex3f(s * 1.08f, -0.20f, 0.62f);
+            glVertex3f(s * 1.08f,  0.24f, 0.62f); glVertex3f(s * 0.68f,  0.24f, 0.62f);
 
-            // Ana kanat ust yuzeyi (kirmizi zemin)
+            // LERX (Leading-Edge Root Extension)
+            glNormal3f(0.0f, 1.0f, 0.0f);
+            glColor3f(0.94f, 0.95f, 0.98f);
+            glVertex3f(s * 0.75f, 0.05f, 2.55f); glVertex3f(s * 1.25f, 0.04f, 1.05f);
+            glVertex3f(s * 0.92f, 0.04f, 0.85f); glVertex3f(s * 0.72f, 0.05f, 1.45f);
+
+            // Ana kanat ust/alt yuzey (Kirmizi-Beyaz Turk Yildizlari deseni)
             glNormal3f(0.0f, 1.0f, 0.0f);
             glColor3f(0.88f, 0.12f, 0.14f);
-            glVertex3f(s * 0.92f,  0.04f,  0.85f);
-            glVertex3f(s * 5.10f, -0.02f, -2.40f);
-            glVertex3f(s * 5.10f, -0.02f, -3.65f);
-            glVertex3f(s * 0.92f,  0.04f, -3.90f);
+            glVertex3f(s * 0.92f,  0.04f,  0.85f); glVertex3f(s * 5.10f, -0.02f, -2.40f);
+            glVertex3f(s * 5.10f, -0.02f, -3.65f); glVertex3f(s * 0.92f,  0.04f, -3.90f);
 
-            // Ana kanat ustunde Turk Yildizlari beyaz ok/serit deseni
             glColor3f(0.97f, 0.98f, 1.00f);
-            glVertex3f(s * 1.35f,  0.055f, -0.45f);
-            glVertex3f(s * 4.45f,  0.005f, -2.55f);
-            glVertex3f(s * 4.45f,  0.005f, -3.15f);
-            glVertex3f(s * 1.35f,  0.055f, -1.85f);
+            glVertex3f(s * 1.35f,  0.055f, -0.45f); glVertex3f(s * 4.45f,  0.005f, -2.55f);
+            glVertex3f(s * 4.45f,  0.005f, -3.15f); glVertex3f(s * 1.35f,  0.055f, -1.85f);
 
-            // Ana kanat alt yuzeyi
             glNormal3f(0.0f, -1.0f, 0.0f);
             glColor3f(0.84f, 0.11f, 0.13f);
-            glVertex3f(s * 0.92f, -0.05f,  0.85f);
-            glVertex3f(s * 0.92f, -0.05f, -3.90f);
-            glVertex3f(s * 5.10f, -0.08f, -3.65f);
-            glVertex3f(s * 5.10f, -0.08f, -2.40f);
+            glVertex3f(s * 0.92f, -0.05f,  0.85f); glVertex3f(s * 0.92f, -0.05f, -3.90f);
+            glVertex3f(s * 5.10f, -0.08f, -3.65f); glVertex3f(s * 5.10f, -0.08f, -2.40f);
 
-            // Kanat hucum kenari (leading edge) kalinligi
             glNormal3f(s * 0.6f, 0.1f, 0.8f);
             glColor3f(0.95f, 0.96f, 0.98f);
-            glVertex3f(s * 0.92f, -0.05f,  0.85f);
-            glVertex3f(s * 5.10f, -0.08f, -2.40f);
-            glVertex3f(s * 5.10f, -0.02f, -2.40f);
-            glVertex3f(s * 0.92f,  0.04f,  0.85f);
+            glVertex3f(s * 0.92f, -0.05f,  0.85f); glVertex3f(s * 5.10f, -0.08f, -2.40f);
+            glVertex3f(s * 5.10f, -0.02f, -2.40f); glVertex3f(s * 0.92f,  0.04f,  0.85f);
 
-            // Kanat ucu fuze raylari (wingtip rails)
+            // Kanat ucu fuze rayi + beyaz duman/muhimmat podu
             glColor3f(0.95f, 0.95f, 0.96f);
-            emitBoxFaces(s * 5.15f, -0.10f, -2.85f, 0.14f, 2.20f, 0.18f, 1, 0, 1, 1);
+            emitBoxFaces(s * 5.15f, -0.06f, -2.85f, 0.14f, 2.25f, 0.18f, 1, 0, 1, 1);
+            glColor3f(0.88f, 0.14f, 0.16f);
+            emitBoxFaces(s * 5.18f, -0.05f, -2.55f, 0.12f, 2.65f, 0.12f, 1, 0, 1, 1);
 
-            // Hareketli Aileron (kanat dis firar kenari)
             float dyAil = std::sin(aileronAng * s) * 0.28f;
             glNormal3f(0.0f, 1.0f, 0.0f);
             glColor3f(0.96f, 0.96f, 0.96f);
-            glVertex3f(s * 3.20f, 0.0f, -3.72f);
-            glVertex3f(s * 4.95f, -0.05f, -3.62f);
-            glVertex3f(s * 4.95f, -0.05f + dyAil, -4.15f);
-            glVertex3f(s * 3.20f, 0.0f + dyAil, -4.25f);
+            glVertex3f(s * 3.20f, 0.0f, -3.72f); glVertex3f(s * 4.95f, -0.05f, -3.62f);
+            glVertex3f(s * 4.95f, -0.05f + dyAil, -4.15f); glVertex3f(s * 3.20f, 0.0f + dyAil, -4.25f);
 
-            // Hareketli Flap (kanat ic firar kenari, [H] tusu)
             float dyFlap = -std::sin(flapAng) * 0.35f;
             glColor3f(0.82f, 0.14f, 0.16f);
-            glVertex3f(s * 1.05f, 0.0f, -3.85f);
-            glVertex3f(s * 3.10f, 0.0f, -3.72f);
-            glVertex3f(s * 3.10f, dyFlap, -4.32f);
-            glVertex3f(s * 1.05f, dyFlap, -4.45f);
+            glVertex3f(s * 1.05f, 0.0f, -3.85f); glVertex3f(s * 3.10f, 0.0f, -3.72f);
+            glVertex3f(s * 3.10f, dyFlap, -4.32f); glVertex3f(s * 1.05f, dyFlap, -4.45f);
 
-            // Hareketli All-Moving Stabilator / Elevator (I/K veya Ok tuslari)
             float dyElev = std::sin(elevAng) * 0.36f;
             glColor3f(0.24f, 0.26f, 0.30f);
-            glVertex3f(s * 0.72f, -0.05f, -5.40f);
-            glVertex3f(s * 2.85f, -0.08f, -6.45f);
-            glVertex3f(s * 2.85f, -0.08f + dyElev, -7.25f);
-            glVertex3f(s * 0.72f, -0.05f + dyElev, -7.10f);
+            glVertex3f(s * 0.72f, -0.05f, -5.40f); glVertex3f(s * 2.85f, -0.08f, -6.45f);
+            glVertex3f(s * 2.85f, -0.08f + dyElev, -7.25f); glVertex3f(s * 0.72f, -0.05f + dyElev, -7.10f);
         }
 
-        // 3D Ust Sirt Omurgasi (Dorsal Spine) + 3D Hacimsel Dikey Kuyruk (Vertical Stabilizer)
-        // Sirt omurgasi (kanopi arkasindan dikey kuyruga uzanan kirmizi 3D omurga)
         glColor3f(0.88f, 0.12f, 0.14f);
         emitBoxFaces(0.0f, 0.52f, -2.40f, 0.28f, 3.60f, 0.32f, 1, 0, 1, 1);
-
-        // 3D Dikey Kuyruk: taban yari-kalinligi 0.11m, tepe yari-kalinligi 0.05m (arkadan bakildiginda net 3D gorunur)
         float bW = 0.11f, tW = 0.05f;
-        // Sag ve sol yan yuzler (kirmizi kuyruk + beyaz Turk Yildizlari kusagi)
         for (int side = -1; side <= 1; side += 2) {
             float s = (float)side;
             glNormal3f(s, 0.05f, 0.0f);
             glColor3f(0.88f, 0.12f, 0.14f);
-            glVertex3f(s * bW, 0.45f, -3.50f);
-            glVertex3f(s * tW, 2.85f, -6.25f);
-            glVertex3f(s * tW, 2.85f, -7.20f);
-            glVertex3f(s * bW, 0.45f, -7.10f);
-            // Beyaz kuyruk armasi seridi
+            glVertex3f(s * bW, 0.45f, -3.50f); glVertex3f(s * tW, 2.85f, -6.25f);
+            glVertex3f(s * tW, 2.85f, -7.20f); glVertex3f(s * bW, 0.45f, -7.10f);
             glColor3f(0.97f, 0.98f, 1.00f);
-            glVertex3f(s * (bW * 0.82f + 0.004f), 1.25f, -4.60f);
-            glVertex3f(s * (tW * 1.15f + 0.004f), 2.35f, -5.85f);
-            glVertex3f(s * (tW * 1.15f + 0.004f), 2.35f, -6.95f);
-            glVertex3f(s * (bW * 0.82f + 0.004f), 1.25f, -6.85f);
+            glVertex3f(s * (bW * 0.82f + 0.004f), 1.25f, -4.60f); glVertex3f(s * (tW * 1.15f + 0.004f), 2.35f, -5.85f);
+            glVertex3f(s * (tW * 1.15f + 0.004f), 2.35f, -6.95f); glVertex3f(s * (bW * 0.82f + 0.004f), 1.25f, -6.85f);
         }
-        // Dikey kuyruk on hucum kenari (swept leading edge)
         glNormal3f(0.0f, 0.65f, 0.75f);
         glColor3f(0.96f, 0.97f, 0.99f);
-        glVertex3f(-bW, 0.45f, -3.50f);
-        glVertex3f( bW, 0.45f, -3.50f);
-        glVertex3f( tW, 2.85f, -6.25f);
-        glVertex3f(-tW, 2.85f, -6.25f);
-        // Dikey kuyruk arka kenari (chase kameraya bakan yuz - arkadan bakista kuyrugu net gosterir)
+        glVertex3f(-bW, 0.45f, -3.50f); glVertex3f( bW, 0.45f, -3.50f);
+        glVertex3f( tW, 2.85f, -6.25f); glVertex3f(-tW, 2.85f, -6.25f);
         glNormal3f(0.0f, 0.0f, -1.0f);
         glColor3f(0.88f, 0.12f, 0.14f);
-        glVertex3f(-bW, 0.45f, -7.10f);
-        glVertex3f( bW, 0.45f, -7.10f);
-        glVertex3f( tW, 2.85f, -7.20f);
-        glVertex3f(-tW, 2.85f, -7.20f);
-        // Dikey kuyruk tepe kapagi
+        glVertex3f(-bW, 0.45f, -7.10f); glVertex3f( bW, 0.45f, -7.10f);
+        glVertex3f( tW, 2.85f, -7.20f); glVertex3f(-tW, 2.85f, -7.20f);
         glNormal3f(0.0f, 1.0f, 0.0f);
         glColor3f(0.96f, 0.97f, 0.99f);
-        glVertex3f(-tW, 2.85f, -6.25f);
-        glVertex3f( tW, 2.85f, -6.25f);
-        glVertex3f( tW, 2.85f, -7.20f);
-        glVertex3f(-tW, 2.85f, -7.20f);
+        glVertex3f(-tW, 2.85f, -6.25f); glVertex3f( tW, 2.85f, -6.25f);
+        glVertex3f( tW, 2.85f, -7.20f); glVertex3f(-tW, 2.85f, -7.20f);
 
-        // 3D Hareketli Rudder (Q/E)
         float dxRud = -std::sin(rudderAng) * 0.38f;
         for (int side = -1; side <= 1; side += 2) {
             float s = (float)side;
             glNormal3f(s, 0.0f, -0.2f);
             glColor3f(0.96f, 0.96f, 0.98f);
-            glVertex3f(s * (bW * 0.7f), 0.55f, -7.10f);
-            glVertex3f(s * (tW * 0.8f), 2.75f, -7.20f);
-            glVertex3f(dxRud + s * 0.025f, 2.75f, -7.75f);
-            glVertex3f(dxRud + s * 0.025f, 0.55f, -7.65f);
+            glVertex3f(s * (bW * 0.7f), 0.55f, -7.10f); glVertex3f(s * (tW * 0.8f), 2.75f, -7.20f);
+            glVertex3f(dxRud + s * 0.025f, 2.75f, -7.75f); glVertex3f(dxRud + s * 0.025f, 0.55f, -7.65f);
         }
-        // Rudder arka kenari
         glNormal3f(0.0f, 0.0f, -1.0f);
         glColor3f(0.92f, 0.14f, 0.16f);
-        glVertex3f(dxRud - 0.03f, 0.55f, -7.65f);
-        glVertex3f(dxRud + 0.03f, 0.55f, -7.65f);
-        glVertex3f(dxRud + 0.03f, 2.75f, -7.75f);
-        glVertex3f(dxRud - 0.03f, 2.75f, -7.75f);
+        glVertex3f(dxRud - 0.03f, 0.55f, -7.65f); glVertex3f(dxRud + 0.03f, 0.55f, -7.65f);
+        glVertex3f(dxRud + 0.03f, 2.75f, -7.75f); glVertex3f(dxRud - 0.03f, 2.75f, -7.75f);
 
-        // Ust Hava Freni (SPACE basildiginda acilan dorsal airbrake)
         if (ac.brakeInput > 0.05f) {
             float brkH = ac.brakeInput * 0.65f;
             glColor3f(0.32f, 0.34f, 0.38f);
-            glVertex3f(-0.38f, 0.62f, -3.20f);
-            glVertex3f( 0.38f, 0.62f, -3.20f);
-            glVertex3f( 0.38f, 0.62f + brkH, -4.35f);
-            glVertex3f(-0.38f, 0.62f + brkH, -4.35f);
+            glVertex3f(-0.38f, 0.62f, -3.20f); glVertex3f( 0.38f, 0.62f, -3.20f);
+            glVertex3f( 0.38f, 0.62f + brkH, -4.35f); glVertex3f(-0.38f, 0.62f + brkH, -4.35f);
         }
         glEnd();
 
-        // Mavi/Turuncu Sok Halkali (Shock Diamonds) Afterburner Alevi (throttle > 0.80f)
         if (ac.throttle > 0.80f && !ac.crashed) {
             float abPower = clampf((ac.throttle - 0.80f) / 0.45f, 0.0f, 1.0f);
             float flameLen = 2.5f + abPower * 4.8f + std::sin(simTime * 65.0f) * 0.35f;
             glDisable(GL_LIGHTING);
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-            // Dis mavi/turuncu plazma konisi
             glBegin(GL_TRIANGLE_FAN);
             glColor4f(0.45f, 0.82f, 1.0f, 0.92f);
             glVertex3f(0.0f, 0.0f, -7.60f);
@@ -5366,7 +7222,6 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
                 glVertex3f(std::cos(a) * 0.48f, std::sin(a) * 0.48f, -7.60f - flameLen);
             }
             glEnd();
-            // 5 adet parlak mavi/sari Mach sok halkasi (shock diamonds)
             for (int r = 1; r <= 5; r++) {
                 float rz = -7.60f - (flameLen * 0.17f * r);
                 float rad = (0.38f - r * 0.05f) * (0.85f + 0.15f * std::sin(simTime * 80.0f + r));
@@ -5384,61 +7239,54 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
             glDisable(GL_BLEND);
             glEnable(GL_LIGHTING);
         }
+        drawLandingGear3D(ac.gearAnim, ac.wheelDeflect, AC_SPECS[ac.type].wingSpan);
     } else if (ac.type == AC_CESSNA) {
-        // 2. MICROSOFT FLIGHT SIMULATOR (MSFS) CESSNA 172 SKYHAWK SP G1000
-        //    14 Enine Kesitli Lofted Govde + Panoramik Kabin Camlari + 3-Palli 3D Pervane & Blur Diski
-        //    + Kamberli Dihedral Ust Kanat + V-Dikmeler + Aerodinamik Tekerlek Pacaliklari (Wheel Spats)
+        // 2. GELISMIS CESSNA 172 SKYHAWK SP (26 radial segment, gercek kanat & yatay stabilizator profili, 3D tekerlekler)
         static const LoftSec cessnaSecs[14] = {
-            { 4.15f, 0.04f, 0.04f, -0.06f, 1.0f}, // Krom pervane spinner ucu
-            { 3.72f, 0.28f, 0.26f, -0.05f, 1.0f}, // Spinner tabani
-            { 3.55f, 0.56f, 0.48f, -0.04f, 1.02f}, // Motor kaputu on (cowling)
-            { 2.35f, 0.66f, 0.56f,  0.00f, 1.08f}, // Motor kaputu arka / on cam tabani
-            { 1.35f, 0.72f, 0.82f,  0.18f, 1.38f}, // Kokpit on tavan (ust kanat baglantisi)
-            { 0.15f, 0.72f, 0.82f,  0.18f, 1.38f}, // Yolcu kabini orta
-            {-0.95f, 0.64f, 0.70f,  0.12f, 1.22f}, // Kabin arka cam baslangici
-            {-1.85f, 0.52f, 0.54f,  0.04f, 1.06f}, // Arka cam bitisi / kuyruk konisi
+            { 4.15f, 0.04f, 0.04f, -0.06f, 1.0f},
+            { 3.72f, 0.28f, 0.26f, -0.05f, 1.0f},
+            { 3.55f, 0.56f, 0.48f, -0.04f, 1.02f},
+            { 2.35f, 0.66f, 0.56f,  0.00f, 1.08f},
+            { 1.35f, 0.72f, 0.82f,  0.18f, 1.38f},
+            { 0.15f, 0.72f, 0.82f,  0.18f, 1.38f},
+            {-0.95f, 0.64f, 0.70f,  0.12f, 1.22f},
+            {-1.85f, 0.52f, 0.54f,  0.04f, 1.06f},
             {-2.85f, 0.40f, 0.44f,  0.02f, 1.02f},
             {-3.85f, 0.30f, 0.34f,  0.01f, 1.00f},
             {-4.65f, 0.21f, 0.26f,  0.00f, 1.00f},
             {-5.25f, 0.14f, 0.20f,  0.00f, 1.00f},
             {-5.60f, 0.09f, 0.15f,  0.00f, 1.00f},
-            {-5.82f, 0.04f, 0.10f,  0.00f, 1.00f}  // Kuyruk konisi ucu
+            {-5.82f, 0.04f, 0.10f,  0.00f, 1.00f}
         };
-        drawLoftedFuselage(cessnaSecs, 14, 20, 3, 7, 0.97f, 0.98f, 1.00f, 0.10f, 0.32f, 0.72f);
+        drawLoftedFuselage(cessnaSecs, 14, 26, 3, 7, 0.97f, 0.98f, 1.00f, 0.10f, 0.32f, 0.72f);
 
         glBegin(GL_QUADS);
-        // Motor kaputu on hava sogutma girisleri (dual Lycoming cooling intakes) + altin MSFS seridi
+        // VHF sirt anteni + alt egzoz borusu
+        glColor3f(0.86f, 0.88f, 0.92f);
+        emitBoxFaces(0.0f, 0.95f, -0.55f, 0.03f, 0.14f, 0.42f, 1, 0, 1, 1);
+        glColor3f(0.32f, 0.30f, 0.28f);
+        emitBoxFaces(0.18f, -0.46f, 2.25f, 0.08f, 0.65f, 0.08f, 1, 0, 1, 1);
+
         glNormal3f(0.0f, 0.0f, 1.0f);
         glColor3f(0.12f, 0.14f, 0.18f);
         for (int side = -1; side <= 1; side += 2) {
             float s = (float)side;
-            glVertex3f(s * 0.14f, -0.18f, 3.58f);
-            glVertex3f(s * 0.42f, -0.18f, 3.58f);
-            glVertex3f(s * 0.42f, -0.02f, 3.58f);
-            glVertex3f(s * 0.14f, -0.02f, 3.58f);
+            glVertex3f(s * 0.14f, -0.18f, 3.58f); glVertex3f(s * 0.42f, -0.18f, 3.58f);
+            glVertex3f(s * 0.42f, -0.02f, 3.58f); glVertex3f(s * 0.14f, -0.02f, 3.58f);
 
-            // Govde yanlarinda altin sarisi + lacivert MSFS G1000 akici seritleri ve yan kabin pencereleri
             glNormal3f(s, 0.05f, 0.0f);
             glColor3f(0.88f, 0.70f, 0.22f);
-            glVertex3f(s * 0.67f, -0.05f,  2.20f);
-            glVertex3f(s * 0.73f,  0.02f,  0.10f);
-            glVertex3f(s * 0.73f,  0.10f,  0.10f);
-            glVertex3f(s * 0.67f,  0.03f,  2.20f);
+            glVertex3f(s * 0.67f, -0.05f,  2.20f); glVertex3f(s * 0.73f,  0.02f,  0.10f);
+            glVertex3f(s * 0.73f,  0.10f,  0.10f); glVertex3f(s * 0.67f,  0.03f,  2.20f);
 
-            glVertex3f(s * 0.73f,  0.02f,  0.10f);
-            glVertex3f(s * 0.31f,  0.04f, -3.85f);
-            glVertex3f(s * 0.31f,  0.11f, -3.85f);
-            glVertex3f(s * 0.73f,  0.10f,  0.10f);
+            glVertex3f(s * 0.73f,  0.02f,  0.10f); glVertex3f(s * 0.31f,  0.04f, -3.85f);
+            glVertex3f(s * 0.31f,  0.11f, -3.85f); glVertex3f(s * 0.73f,  0.10f,  0.10f);
 
-            // Yan kabin camlari (koyu fume/mavi reflekte cam)
-            glColor3f(0.16f, 0.38f, 0.64f);
-            glVertex3f(s * 0.725f, 0.26f,  1.25f);
-            glVertex3f(s * 0.725f, 0.26f, -0.85f);
-            glVertex3f(s * 0.680f, 0.68f, -0.75f);
-            glVertex3f(s * 0.680f, 0.68f,  1.15f);
+            glColor3f(0.14f, 0.32f, 0.56f);
+            glVertex3f(s * 0.725f, 0.26f,  1.25f); glVertex3f(s * 0.725f, 0.26f, -0.85f);
+            glVertex3f(s * 0.680f, 0.68f, -0.75f); glVertex3f(s * 0.680f, 0.68f,  1.15f);
         }
 
-        // 3D Kamberli Dihedral Ust Kanat (High Wing, 11.2m aciklik, 2.5 derece dihedral + lacivert wingtip)
         // Orta kanat kabin tavan birlesimi
         glColor3f(0.97f, 0.98f, 1.00f);
         emitBoxFaces(0.0f, 0.84f, 0.55f, 1.50f, 1.52f, 0.15f, 1, 0, 1, 1);
@@ -5447,11 +7295,10 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
             float s = (float)side;
             float xRoot = s * 0.72f, xTip = s * 5.62f;
             float yRootU = 0.98f, yRootL = 0.83f;
-            float yTipU  = 1.18f, yTipL  = 1.07f; // Dihedral yukselisi
+            float yTipU  = 1.18f, yTipL  = 1.07f;
             float zRootF = 1.30f, zRootB = -0.22f;
             float zTipF  = 1.12f, zTipB  = -0.05f;
 
-            // Ust kanat yuzeyi (Beyaz + Kanat ucu MSFS Lacivert/Altin serit)
             glNormal3f(-s * 0.04f, 0.99f, 0.0f);
             glColor3f(0.97f, 0.98f, 1.00f);
             glVertex3f(xRoot, yRootU, zRootF);
@@ -5459,147 +7306,112 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
             glVertex3f(xTip * 0.84f, lerpf(yRootU, yTipU, 0.84f), lerpf(zRootB, zTipB, 0.84f));
             glVertex3f(xRoot, yRootU, zRootB);
 
-            // Kanat ucu lacivert MSFS grafik kaplamasi
             glColor3f(0.10f, 0.32f, 0.72f);
             glVertex3f(xTip * 0.84f, lerpf(yRootU, yTipU, 0.84f), lerpf(zRootF, zTipF, 0.84f));
             glVertex3f(xTip, yTipU, zTipF);
             glVertex3f(xTip, yTipU, zTipB);
             glVertex3f(xTip * 0.84f, lerpf(yRootU, yTipU, 0.84f), lerpf(zRootB, zTipB, 0.84f));
 
-            // Alt kanat yuzeyi
             glNormal3f(0.0f, -1.0f, 0.0f);
             glColor3f(0.93f, 0.95f, 0.98f);
-            glVertex3f(xRoot, yRootL, zRootF);
-            glVertex3f(xRoot, yRootL, zRootB);
-            glVertex3f(xTip,  yTipL,  zTipB);
-            glVertex3f(xTip,  yTipL,  zTipF);
+            glVertex3f(xRoot, yRootL, zRootF); glVertex3f(xRoot, yRootL, zRootB);
+            glVertex3f(xTip,  yTipL,  zTipB); glVertex3f(xTip,  yTipL,  zTipF);
 
-            // Kanat on hucum kenari (Leading Edge)
             glNormal3f(0.0f, 0.15f, 0.98f);
             glColor3f(0.98f, 0.99f, 1.00f);
-            glVertex3f(xRoot, yRootL, zRootF);
-            glVertex3f(xTip,  yTipL,  zTipF);
-            glVertex3f(xTip,  yTipU,  zTipF);
-            glVertex3f(xRoot, yRootU, zRootF);
+            glVertex3f(xRoot, yRootL, zRootF); glVertex3f(xTip,  yTipL,  zTipF);
+            glVertex3f(xTip,  yTipU,  zTipF); glVertex3f(xRoot, yRootU, zRootF);
 
-            // Kanat arka firar kenari (Trailing Edge)
             glNormal3f(0.0f, 0.0f, -1.0f);
             glColor3f(0.90f, 0.92f, 0.96f);
-            glVertex3f(xRoot, yRootL, zRootB);
-            glVertex3f(xRoot, yRootU, zRootB);
-            glVertex3f(xTip,  yTipU,  zTipB);
-            glVertex3f(xTip,  yTipL,  zTipB);
+            glVertex3f(xRoot, yRootL, zRootB); glVertex3f(xRoot, yRootU, zRootB);
+            glVertex3f(xTip,  yTipU,  zTipB); glVertex3f(xTip,  yTipL,  zTipB);
 
-            // Kanat ucu asagi kivrik Hoerner wingtip + Navigasyon Isigi (Sol=Kirmizi, Sag=Yesil)
             glNormal3f(s, 0.0f, 0.0f);
             glColor3f(0.10f, 0.32f, 0.72f);
             glVertex3f(xTip, yTipU, zTipF);
-            glVertex3f(xTip + s * 0.14f, yTipL - 0.06f, zTipF - 0.08f);
-            glVertex3f(xTip + s * 0.14f, yTipL - 0.06f, zTipB);
+            glVertex3f(xTip + s * 0.16f, yTipL - 0.05f, zTipF - 0.10f);
+            glVertex3f(xTip + s * 0.16f, yTipL - 0.05f, zTipB + 0.05f);
             glVertex3f(xTip, yTipU, zTipB);
 
-            // Aerodinamik profil dikmeler (Wing Struts + Cuff Fairings)
+            // Wing struts + cuffs
             glNormal3f(s * 0.5f, 0.5f, 0.5f);
             glColor3f(0.94f, 0.96f, 0.99f);
-            glVertex3f(s * 0.66f, -0.22f, 0.62f);
-            glVertex3f(s * 0.66f, -0.22f, 0.44f);
-            glVertex3f(s * 3.45f,  1.02f, 0.48f);
-            glVertex3f(s * 3.45f,  1.02f, 0.66f);
+            glVertex3f(s * 0.66f, -0.22f, 0.62f); glVertex3f(s * 0.66f, -0.22f, 0.44f);
+            glVertex3f(s * 3.45f,  1.02f, 0.48f); glVertex3f(s * 3.45f,  1.02f, 0.66f);
 
             glNormal3f(-s * 0.5f, -0.5f, -0.5f);
-            glVertex3f(s * 0.66f, -0.28f, 0.62f);
-            glVertex3f(s * 3.45f,  0.96f, 0.66f);
-            glVertex3f(s * 3.45f,  0.96f, 0.48f);
-            glVertex3f(s * 0.66f, -0.28f, 0.44f);
+            glVertex3f(s * 0.66f, -0.28f, 0.62f); glVertex3f(s * 3.45f,  0.96f, 0.66f);
+            glVertex3f(s * 3.45f,  0.96f, 0.48f); glVertex3f(s * 0.66f, -0.28f, 0.44f);
 
-            // Hareketli 3D Aileron (Sol/Sag yatista zit yonde calisir)
             float dyAil = std::sin(aileronAng * s) * 0.24f;
             float yA0 = lerpf(yRootU, yTipU, 0.58f), yA1 = lerpf(yRootU, yTipU, 0.95f);
             float zA0 = lerpf(zRootB, zTipB, 0.58f), zA1 = lerpf(zRootB, zTipB, 0.95f);
             glNormal3f(0.0f, 1.0f, 0.0f);
             glColor3f(0.92f, 0.94f, 0.98f);
-            glVertex3f(s * 3.25f, yA0 - 0.04f, zA0);
-            glVertex3f(s * 5.35f, yA1 - 0.04f, zA1);
-            glVertex3f(s * 5.35f, yA1 - 0.04f + dyAil, zA1 - 0.38f);
-            glVertex3f(s * 3.25f, yA0 - 0.04f + dyAil, zA0 - 0.38f);
+            glVertex3f(s * 3.25f, yA0 - 0.04f, zA0); glVertex3f(s * 5.35f, yA1 - 0.04f, zA1);
+            glVertex3f(s * 5.35f, yA1 - 0.04f + dyAil, zA1 - 0.38f); glVertex3f(s * 3.25f, yA0 - 0.04f + dyAil, zA0 - 0.38f);
 
-            // Hareketli 3D Slotted Flap ([H] tusu)
             float dyFlap = -std::sin(flapAng) * 0.32f;
             float yF0 = lerpf(yRootU, yTipU, 0.14f), yF1 = lerpf(yRootU, yTipU, 0.55f);
             float zF0 = lerpf(zRootB, zTipB, 0.14f), zF1 = lerpf(zRootB, zTipB, 0.55f);
             glColor3f(0.14f, 0.38f, 0.78f);
-            glVertex3f(s * 0.78f, yF0 - 0.05f, zF0);
-            glVertex3f(s * 3.15f, yF1 - 0.05f, zF1);
-            glVertex3f(s * 3.15f, yF1 - 0.05f + dyFlap, zF1 - 0.42f);
-            glVertex3f(s * 0.78f, yF0 - 0.05f + dyFlap, zF0 - 0.42f);
+            glVertex3f(s * 0.78f, yF0 - 0.05f, zF0); glVertex3f(s * 3.15f, yF1 - 0.05f, zF1);
+            glVertex3f(s * 3.15f, yF1 - 0.05f + dyFlap, zF1 - 0.42f); glVertex3f(s * 0.78f, yF0 - 0.05f + dyFlap, zF0 - 0.42f);
         }
 
-        // 3D Yatay Stabilizator + Hareketli Elevator
-        glColor3f(0.96f, 0.97f, 0.99f);
-        emitBoxFaces(0.0f, 0.04f, -4.95f, 3.65f, 0.85f, 0.11f, 1, 0, 1, 1);
+        // Gercek Geriye Daralan Yatay Stabilizator + Hareketli Elevator
+        emitTaperedAirfoilPair(0.18f, 0.06f, -4.55f, -5.32f, 0.12f,
+                               1.85f, 0.06f, -4.88f, -5.48f, 0.06f, 0.96f, 0.97f, 0.99f);
         float dyElev = std::sin(elevAng) * 0.28f;
+        glNormal3f(0.0f, 1.0f, 0.0f);
         glColor3f(0.12f, 0.34f, 0.74f);
-        glVertex3f(-1.78f, 0.09f, -5.36f);
-        glVertex3f( 1.78f, 0.09f, -5.36f);
-        glVertex3f( 1.78f, 0.09f + dyElev, -5.82f);
-        glVertex3f(-1.78f, 0.09f + dyElev, -5.82f);
+        glVertex3f(-1.82f, 0.09f, -5.47f); glVertex3f( 1.82f, 0.09f, -5.47f);
+        glVertex3f( 1.72f, 0.09f + dyElev, -5.92f); glVertex3f(-1.72f, 0.09f + dyElev, -5.92f);
 
-        // 3D Hacimsel Geriye Egimli (Swept) Dikey Kuyruk + Dorsal Fin Fillet + Hareketli Rudder
+        // Swept Dikey Kuyruk + Kavisli Dorsal Fin + Rudder
         float vbW = 0.09f, vtW = 0.045f;
-        // Sirt yuzgeci (Dorsal Fin Fillet)
+        glNormal3f(0.0f, 0.6f, 0.8f);
         glColor3f(0.96f, 0.97f, 0.99f);
-        emitBoxFaces(0.0f, 0.18f, -3.55f, 0.12f, 1.50f, 0.22f, 1, 0, 1, 1);
-
         for (int side = -1; side <= 1; side += 2) {
             float s = (float)side;
+            // Sirt yuzgeci fillet
+            glNormal3f(s, 0.1f, 0.0f);
+            glVertex3f(s * 0.08f, 0.18f, -2.95f); glVertex3f(s * 0.09f, 0.56f, -4.35f);
+            glVertex3f(s * 0.09f, 0.12f, -4.35f); glVertex3f(s * 0.08f, 0.12f, -2.95f);
+
             glNormal3f(s, 0.04f, 0.0f);
             glColor3f(0.96f, 0.97f, 0.99f);
-            glVertex3f(s * vbW, 0.12f, -4.15f);
-            glVertex3f(s * vtW, 1.82f, -5.15f);
-            glVertex3f(s * vtW, 1.82f, -5.75f);
-            glVertex3f(s * vbW, 0.12f, -5.65f);
+            glVertex3f(s * vbW, 0.12f, -4.15f); glVertex3f(s * vtW, 1.84f, -5.15f);
+            glVertex3f(s * vtW, 1.84f, -5.75f); glVertex3f(s * vbW, 0.12f, -5.65f);
 
-            // Dikey kuyruk uzerinde MSFS lacivert & altin kusak
             glColor3f(0.10f, 0.32f, 0.72f);
-            glVertex3f(s * (vbW + 0.004f), 0.55f, -4.45f);
-            glVertex3f(s * (vtW + 0.004f), 1.55f, -5.05f);
-            glVertex3f(s * (vtW + 0.004f), 1.55f, -5.68f);
-            glVertex3f(s * (vbW + 0.004f), 0.55f, -5.58f);
+            glVertex3f(s * (vbW + 0.004f), 0.55f, -4.45f); glVertex3f(s * (vtW + 0.004f), 1.55f, -5.05f);
+            glVertex3f(s * (vtW + 0.004f), 1.55f, -5.68f); glVertex3f(s * (vbW + 0.004f), 0.55f, -5.58f);
 
             glColor3f(0.88f, 0.70f, 0.22f);
-            glVertex3f(s * (vbW + 0.006f), 0.42f, -4.38f);
-            glVertex3f(s * (vtW + 0.006f), 1.40f, -4.98f);
-            glVertex3f(s * (vtW + 0.006f), 1.48f, -5.02f);
-            glVertex3f(s * (vbW + 0.006f), 0.50f, -4.42f);
+            glVertex3f(s * (vbW + 0.006f), 0.42f, -4.38f); glVertex3f(s * (vtW + 0.006f), 1.40f, -4.98f);
+            glVertex3f(s * (vtW + 0.006f), 1.48f, -5.02f); glVertex3f(s * (vbW + 0.006f), 0.50f, -4.42f);
         }
-        // Dikey kuyruk on ve arka kenar kapaklari (chase kamerada net 3D kalinlik)
         glNormal3f(0.0f, 0.55f, 0.83f);
         glColor3f(0.97f, 0.98f, 1.00f);
-        glVertex3f(-vbW, 0.12f, -4.15f);
-        glVertex3f( vbW, 0.12f, -4.15f);
-        glVertex3f( vtW, 1.82f, -5.15f);
-        glVertex3f(-vtW, 1.82f, -5.15f);
+        glVertex3f(-vbW, 0.12f, -4.15f); glVertex3f( vbW, 0.12f, -4.15f);
+        glVertex3f( vtW, 1.84f, -5.15f); glVertex3f(-vtW, 1.84f, -5.15f);
 
         glNormal3f(0.0f, 0.0f, -1.0f);
         glColor3f(0.10f, 0.32f, 0.72f);
-        glVertex3f(-vbW, 0.12f, -5.65f);
-        glVertex3f( vbW, 0.12f, -5.65f);
-        glVertex3f( vtW, 1.82f, -5.75f);
-        glVertex3f(-vtW, 1.82f, -5.75f);
+        glVertex3f(-vbW, 0.12f, -5.65f); glVertex3f( vbW, 0.12f, -5.65f);
+        glVertex3f( vtW, 1.84f, -5.75f); glVertex3f(-vtW, 1.84f, -5.75f);
 
-        // 3D Hareketli Rudder
         float dxRud = -std::sin(rudderAng) * 0.32f;
         for (int side = -1; side <= 1; side += 2) {
             float s = (float)side;
             glNormal3f(s, 0.0f, -0.2f);
             glColor3f(0.96f, 0.97f, 0.99f);
-            glVertex3f(s * (vbW * 0.75f), 0.16f, -5.65f);
-            glVertex3f(s * (vtW * 0.75f), 1.78f, -5.75f);
-            glVertex3f(dxRud + s * 0.02f, 1.78f, -6.18f);
-            glVertex3f(dxRud + s * 0.02f, 0.16f, -6.08f);
+            glVertex3f(s * (vbW * 0.75f), 0.16f, -5.65f); glVertex3f(s * (vtW * 0.75f), 1.80f, -5.75f);
+            glVertex3f(dxRud + s * 0.02f, 1.80f, -6.18f); glVertex3f(dxRud + s * 0.02f, 0.16f, -6.08f);
         }
 
-        // Cessna 172 Yayli Celik Inis Takimi Bacaklari + Aerodinamik Tekerlek Pacaliklari (Wheel Spats)
         if (ac.gearAnim > 0.02f) {
             float ext = ac.gearAnim;
             float spread = 1.48f;
@@ -5607,40 +7419,42 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
             for (int side = -1; side <= 1; side += 2) {
                 float s = (float)side;
                 float yWheel = yBelly - (1.02f - clampf(ac.wheelDeflect[side < 0 ? 1 : 2], 0.0f, 0.40f)) * ext;
-                // Egimli yayli celik ana dikme (tabular spring steel strut)
                 glColor3f(0.92f, 0.94f, 0.97f);
-                glVertex3f(s * 0.45f, yBelly, -0.35f);
-                glVertex3f(s * 0.45f, yBelly, -0.55f);
-                glVertex3f(s * spread, yWheel + 0.15f, -0.58f);
-                glVertex3f(s * spread, yWheel + 0.15f, -0.38f);
-                // Aerodinamik tekerlek pacaligi (Wheel Fairing / Spat)
+                glVertex3f(s * 0.45f, yBelly, -0.35f); glVertex3f(s * 0.45f, yBelly, -0.55f);
+                glVertex3f(s * spread, yWheel + 0.15f, -0.58f); glVertex3f(s * spread, yWheel + 0.15f, -0.38f);
                 glColor3f(0.97f, 0.98f, 1.00f);
-                emitBoxFaces(s * spread, yWheel - 0.12f, -0.48f, 0.30f, 0.92f, 0.38f, 1, 0, 1, 1);
+                emitBoxFaces(s * spread, yWheel - 0.08f, -0.48f, 0.28f, 0.88f, 0.34f, 1, 0, 1, 1);
                 glColor3f(0.10f, 0.32f, 0.72f);
-                emitBoxFaces(s * spread, yWheel + 0.02f, -0.48f, 0.31f, 0.94f, 0.10f, 1, 0, 1, 1);
+                emitBoxFaces(s * spread, yWheel + 0.04f, -0.48f, 0.29f, 0.90f, 0.09f, 1, 0, 1, 1);
             }
-            // Burun tekerlegi aerodinamik pacaligi
             float yNoseW = yBelly - (1.02f - clampf(ac.wheelDeflect[0], 0.0f, 0.40f)) * ext;
             glColor3f(0.97f, 0.98f, 1.00f);
-            emitBoxFaces(0.0f, yNoseW - 0.12f, 2.50f, 0.26f, 0.78f, 0.34f, 1, 0, 1, 1);
+            emitBoxFaces(0.0f, yNoseW - 0.08f, 2.50f, 0.24f, 0.74f, 0.30f, 1, 0, 1, 1);
+            glEnd();
+            for (int side = -1; side <= 1; side += 2) {
+                float yWheel = yBelly - (1.02f - clampf(ac.wheelDeflect[side < 0 ? 1 : 2], 0.0f, 0.40f)) * ext;
+                drawWheelCylinder3D(side * spread, yWheel - 0.14f, -0.48f, 0.21f, 0.09f);
+            }
+            drawWheelCylinder3D(0.0f, yNoseW - 0.14f, 2.50f, 0.18f, 0.08f);
+        } else {
+            glEnd();
         }
-        glEnd();
 
-        // Kanat ucu Navigasyon Isiklari (Sol=Kirmizi, Sag=Yesil) + Kuyruk Tepe Kirmizi Beacon
+        // Kanat ucu Navigasyon Isiklari + Strobe + Kuyruk Beacon
         glDisable(GL_LIGHTING);
-        glPointSize(6.0f);
+        glPointSize(6.5f);
         glBegin(GL_POINTS);
         glColor3f(1.0f, 0.12f, 0.10f); glVertex3f(-5.68f, 1.12f, 0.55f);
-        glColor3f(0.10f, 1.0f, 0.22f);  glVertex3f( 5.68f, 1.12f, 0.55f);
+        glColor3f(0.10f, 1.0f, 0.22f); glVertex3f( 5.68f, 1.12f, 0.55f);
         if (((int)(simTime * 4.0f)) & 1) {
-            glColor3f(1.0f, 0.18f, 0.12f); glVertex3f(0.0f, 1.88f, -5.45f);
+            glColor3f(1.0f, 0.18f, 0.12f); glVertex3f(0.0f, 1.90f, -5.45f);
             glColor3f(1.0f, 1.0f, 1.0f);   glVertex3f(-5.70f, 1.14f, 0.40f);
             glColor3f(1.0f, 1.0f, 1.0f);   glVertex3f( 5.70f, 1.14f, 0.40f);
         }
         glEnd();
         glEnable(GL_LIGHTING);
 
-        // 3-Palli 3D McCauley Pervane + Yari-Saydam Donen Pervane Blur Diski (MSFS gorunumu)
+        // 3-Palli Tapered McCauley Pervane + Blur Diski
         glPushMatrix();
         glTranslatef(0.0f, -0.05f, 3.85f);
         glPushMatrix();
@@ -5649,23 +7463,26 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
         for (int b = 0; b < 3; b++) {
             float a = b * (2.0f * PI_F / 3.0f);
             float ca = std::cos(a), sa = std::sin(a);
-            glColor3f(0.16f, 0.18f, 0.20f);
-            emitBoxFaces(ca * 0.55f, sa * 0.55f - 0.04f, 0.0f,
-                         std::fabs(ca) * 0.98f + 0.14f, 0.04f, std::fabs(sa) * 0.98f + 0.14f, 1, 0, 1, 1);
+            float dx = ca, dy = sa, px = -sa, py = ca;
+            glColor3f(0.15f, 0.17f, 0.20f);
+            glNormal3f(0.0f, 0.0f, 1.0f);
+            glVertex3f(dx * 0.16f - px * 0.07f, dy * 0.16f - py * 0.07f, 0.02f);
+            glVertex3f(dx * 0.16f + px * 0.07f, dy * 0.16f + py * 0.07f, -0.02f);
+            glVertex3f(dx * 1.05f + px * 0.03f, dy * 1.05f + py * 0.03f, 0.01f);
+            glVertex3f(dx * 1.05f - px * 0.03f, dy * 1.05f - py * 0.03f, -0.01f);
         }
         glEnd();
         glPopMatrix();
 
-        // Yari saydam pervane donus halkasi (Propeller Motion Blur Disc)
         glDisable(GL_LIGHTING);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glBegin(GL_TRIANGLE_FAN);
-        glColor4f(0.85f, 0.90f, 0.95f, 0.18f);
+        glColor4f(0.85f, 0.90f, 0.95f, 0.20f);
         glVertex3f(0.0f, 0.0f, 0.02f);
         for (int k = 0; k <= 24; k++) {
             float a = k * (2.0f * PI_F / 24.0f);
-            glColor4f(0.92f, 0.95f, 0.98f, 0.06f);
+            glColor4f(0.92f, 0.95f, 0.98f, 0.05f);
             glVertex3f(std::cos(a) * 1.12f, std::sin(a) * 1.12f, 0.02f);
         }
         glEnd();
@@ -5673,11 +7490,11 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
         glEnable(GL_LIGHTING);
         glPopMatrix();
     } else {
-        // 3. DG-1000 PLANOR (12 enine kesitli aerodinamik kompozit govde + 20m yuksek aciklikli kanat + T-kuyruk)
+        // 3. DG-1000 PLANOR (20 radial segment, cok kesitli yuksek aciklikli kanat + tapered T-kuyruk)
         static const LoftSec gliderSecs[12] = {
             { 4.20f, 0.04f, 0.04f, -0.06f, 1.0f},
             { 3.50f, 0.24f, 0.22f, -0.04f, 1.1f},
-            { 2.40f, 0.38f, 0.36f,  0.02f, 1.45f}, // Uzun ikiz kanopi
+            { 2.40f, 0.38f, 0.36f,  0.02f, 1.45f},
             { 1.10f, 0.42f, 0.40f,  0.04f, 1.55f},
             {-0.20f, 0.38f, 0.36f,  0.02f, 1.30f},
             {-1.40f, 0.28f, 0.28f,  0.00f, 1.05f},
@@ -5688,41 +7505,34 @@ static void renderAircraftModel(const AircraftState& ac, float simTime) {
             {-5.40f, 0.08f, 0.08f,  0.00f, 1.00f},
             {-5.70f, 0.05f, 0.06f,  0.00f, 1.00f}
         };
-        drawLoftedFuselage(gliderSecs, 12, 16, 2, 5, 0.98f, 0.98f, 1.0f, 0.92f, 0.18f, 0.14f);
+        drawLoftedFuselage(gliderSecs, 12, 20, 2, 5, 0.98f, 0.98f, 1.0f, 0.92f, 0.18f, 0.14f);
 
-        // 20m ince konik planor kanatlari + winglet'ler + T-kuyruk
         glBegin(GL_QUADS);
-        glNormal3f(0.0f, 1.0f, 0.0f);
+        emitTaperedAirfoilPair(0.35f, 0.05f, 0.35f, -0.65f, 0.11f,
+                               5.60f, 0.22f, 0.12f, -0.66f, 0.08f, 0.98f, 0.98f, 1.00f);
+        emitTaperedAirfoilPair(5.60f, 0.22f, 0.12f, -0.66f, 0.08f,
+                               10.0f, 0.40f, -0.15f, -0.68f, 0.05f, 0.98f, 0.98f, 1.00f);
         for (int side = -1; side <= 1; side += 2) {
             float s = (float)side;
-            glColor3f(0.98f, 0.98f, 1.0f);
-            glVertex3f(s * 0.35f, 0.05f,  0.35f);
-            glVertex3f(s * 10.0f, 0.38f, -0.15f);
-            glVertex3f(s * 10.0f, 0.38f, -0.68f);
-            glVertex3f(s * 0.35f, 0.05f, -0.65f);
-            // Hareketli Planor Aileronu
             float dyAil = std::sin(aileronAng * s) * 0.24f;
+            glNormal3f(0.0f, 1.0f, 0.0f);
             glColor3f(0.90f, 0.16f, 0.14f);
-            glVertex3f(s * 6.00f, 0.25f, -0.66f);
-            glVertex3f(s * 9.85f, 0.38f, -0.68f);
-            glVertex3f(s * 9.85f, 0.38f + dyAil, -0.95f);
-            glVertex3f(s * 6.00f, 0.25f + dyAil, -0.95f);
-            // Kirmizi Winglet
-            glColor3f(0.90f, 0.16f, 0.14f);
-            glVertex3f(s * 10.0f, 0.38f, -0.15f);
-            glVertex3f(s * 10.18f, 0.95f, -0.30f);
-            glVertex3f(s * 10.18f, 0.95f, -0.65f);
-            glVertex3f(s * 10.0f, 0.38f, -0.68f);
+            glVertex3f(s * 6.00f, 0.25f, -0.66f); glVertex3f(s * 9.85f, 0.40f, -0.68f);
+            glVertex3f(s * 9.85f, 0.40f + dyAil, -0.95f); glVertex3f(s * 6.00f, 0.25f + dyAil, -0.95f);
+
+            glVertex3f(s * 10.0f, 0.40f, -0.15f); glVertex3f(s * 10.22f, 0.98f, -0.32f);
+            glVertex3f(s * 10.22f, 0.98f, -0.66f); glVertex3f(s * 10.0f, 0.40f, -0.68f);
         }
-        // T-Kuyruk
-        glColor3f(0.96f, 0.97f, 0.99f);
-        emitBoxFaces(0.0f, 0.05f, -5.45f, 0.10f, 0.85f, 1.55f, 1, 0, 1, 1);
-        emitBoxFaces(0.0f, 1.55f, -5.50f, 2.80f, 0.55f, 0.08f, 1, 0, 1, 1);
+        emitBoxFaces(0.0f, 0.05f, -5.45f, 0.09f, 0.85f, 1.55f, 1, 0, 1, 1);
+        emitTaperedAirfoilPair(0.08f, 1.56f, -5.22f, -5.75f, 0.08f,
+                               1.42f, 1.56f, -5.35f, -5.72f, 0.04f, 0.96f, 0.97f, 0.99f);
         glEnd();
+        drawLandingGear3D(ac.gearAnim, ac.wheelDeflect, AC_SPECS[ac.type].wingSpan);
     }
 
-    // 3 Noktali Oleo-Pnomatik Inis Takimi
-    drawLandingGear3D(ac.gearAnim, ac.wheelDeflect, AC_SPECS[ac.type].wingSpan);
+    float zeroSpec[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, zeroSpec);
+    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 0.0f);
     glPopMatrix();
 }
 
@@ -5739,6 +7549,7 @@ static void syncCameraToAircraft() {
 
 static void teleportAircraft(int slot) {
     g_ac.crashed = false;
+    g_collidersDirty = true;
     g_ac.omega = Vec3(0, 0, 0);
     g_ac.pitchInput = g_ac.rollInput = g_ac.yawInput = g_ac.brakeInput = 0.0f;
     g_ac.autopilot = false;
@@ -5748,6 +7559,12 @@ static void teleportAircraft(int slot) {
     g_ac.vsiMs = 0.0f;
     g_ac.ridgeLiftMs = 0.0f;
     g_particles.clear();
+    g_explosions.clear();
+    g_bullets.clear();
+    g_bombs.clear();
+    g_activeFires.clear();
+    g_camShakeMag = 0.0f;
+    g_camShakeTimer = 0.0f;
 
     if (slot == 1) {
         // [1] Adnan Menderes LTBJ 34R Pist Basi (Yerde, Kalkisa Hazir)
@@ -5768,10 +7585,7 @@ static void teleportAircraft(int slot) {
         g_ac.flapDeg = 15.0f;
         g_ac.onGround = true;
         g_ac.gLoad = 1.0f;
-        syncCameraToAircraft();
-        return;
-    }
-    if (slot == 6) {
+    } else if (slot == 6) {
         // [6] Cigli LTBL Pist Basi (Yerde, Kalkisa Hazir)
         Vec2 ltbl = geoPt(LTBL_LAT, LTBL_LON);
         Vec2 dir17 = headingDir(LTBL_HDG);
@@ -5789,41 +7603,40 @@ static void teleportAircraft(int slot) {
         g_ac.flapDeg = 15.0f;
         g_ac.onGround = true;
         g_ac.gLoad = 1.0f;
-        syncCameraToAircraft();
-        return;
+    } else {
+        // Havada baslayan isinlanma noktalari ([2]..[5], [7]..[9], [0])
+        double lat = SAAT_LAT, lon = SAAT_LON;
+        float alt = 260.0f, hdg = 35.0f;
+        switch (slot) {
+            case 2: lat = SAAT_LAT;    lon = SAAT_LON;    alt = 220.0f; hdg = 25.0f;  break; // Konak Saat Kulesi
+            case 3: lat = 38.4375;     lon = 27.1398;     alt = 230.0f; hdg = 35.0f;  break; // Alsancak Kordon/Liman
+            case 4: lat = FOLKART_LAT; lon = FOLKART_LON; alt = 310.0f; hdg = 310.0f; break; // Bayrakli Folkart/Mistral
+            case 5: lat = 38.4556;     lon = 27.1080;     alt = 240.0f; hdg = 285.0f; break; // Karsiyaka/Bostanli
+            case 7: lat = STATIONS[1].lat; lon = STATIONS[1].lon; alt = 260.0f; hdg = 170.0f; break; // Egekent 2 IZBAN
+            case 8: lat = STATIONS[2].lat; lon = STATIONS[2].lon; alt = 260.0f; hdg = 170.0f; break; // Ulukent IZBAN
+            case 9: lat = STATIONS[0].lat; lon = STATIONS[0].lon; alt = 280.0f; hdg = 185.0f; break; // Menemen IZBAN
+            case 0: lat = KULTURPARK_LAT;  lon = KULTURPARK_LON;  alt = 260.0f; hdg = 330.0f; break; // Bornova/Kulturpark
+            default: break;
+        }
+        Vec2 p = geoPt(lat, lon);
+        float terr = std::max(0.0f, sampleTerrainElev(p.x, p.z));
+        g_ac.pos = Vec3(p.x, terr + alt, p.z);
+        setOrientationFromYawPitchRoll(hdg, 1.8f, 0.0f);
+        float cruiseSpd = (g_ac.type == AC_JET) ? 130.0f : (g_ac.type == AC_CESSNA ? 78.0f : 42.0f);
+        g_ac.vel = g_ac.fwd * cruiseSpd;
+        g_ac.airspeedMs = cruiseSpd;
+        g_ac.aglM = alt;
+        g_ac.alphaDeg = 1.8f;
+        g_ac.throttle = (g_ac.type == AC_GLIDER) ? 0.0f : 0.68f;
+        g_ac.gearDown = (g_ac.type == AC_CESSNA);
+        g_ac.gearAnim = (g_ac.type == AC_CESSNA) ? 1.0f : 0.0f;
+        g_ac.flapStage = 0;
+        g_ac.flapDeg = 0.0f;
+        g_ac.onGround = false;
+        g_ac.gLoad = 1.0f;
     }
-
-    // Havada baslayan isinlanma noktalari ([2]..[5], [7]..[9], [0])
-    double lat = SAAT_LAT, lon = SAAT_LON;
-    float alt = 260.0f, hdg = 35.0f;
-    switch (slot) {
-        case 2: lat = SAAT_LAT;    lon = SAAT_LON;    alt = 220.0f; hdg = 25.0f;  break; // Konak Saat Kulesi
-        case 3: lat = 38.4375;     lon = 27.1398;     alt = 230.0f; hdg = 35.0f;  break; // Alsancak Kordon/Liman
-        case 4: lat = FOLKART_LAT; lon = FOLKART_LON; alt = 310.0f; hdg = 310.0f; break; // Bayrakli Folkart/Mistral
-        case 5: lat = 38.4556;     lon = 27.1080;     alt = 240.0f; hdg = 285.0f; break; // Karsiyaka/Bostanli
-        case 7: lat = STATIONS[1].lat; lon = STATIONS[1].lon; alt = 260.0f; hdg = 170.0f; break; // Egekent 2 IZBAN
-        case 8: lat = STATIONS[2].lat; lon = STATIONS[2].lon; alt = 260.0f; hdg = 170.0f; break; // Ulukent IZBAN
-        case 9: lat = STATIONS[0].lat; lon = STATIONS[0].lon; alt = 280.0f; hdg = 185.0f; break; // Menemen IZBAN
-        case 0: lat = KULTURPARK_LAT;  lon = KULTURPARK_LON;  alt = 260.0f; hdg = 330.0f; break; // Bornova/Kulturpark
-        default: break;
-    }
-    Vec2 p = geoPt(lat, lon);
-    float terr = std::max(0.0f, sampleTerrainElev(p.x, p.z));
-    g_ac.pos = Vec3(p.x, terr + alt, p.z);
-    setOrientationFromYawPitchRoll(hdg, 1.8f, 0.0f);
-    float cruiseSpd = (g_ac.type == AC_JET) ? 130.0f : (g_ac.type == AC_CESSNA ? 78.0f : 42.0f);
-    g_ac.vel = g_ac.fwd * cruiseSpd;
-    g_ac.airspeedMs = cruiseSpd;
-    g_ac.aglM = alt;
-    g_ac.alphaDeg = 1.8f;
-    g_ac.throttle = (g_ac.type == AC_GLIDER) ? 0.0f : 0.68f;
-    g_ac.gearDown = (g_ac.type == AC_CESSNA);
-    g_ac.gearAnim = (g_ac.type == AC_CESSNA) ? 1.0f : 0.0f;
-    g_ac.flapStage = 0;
-    g_ac.flapDeg = 0.0f;
-    g_ac.onGround = false;
-    g_ac.gLoad = 1.0f;
     syncCameraToAircraft();
+    if (g_glReady) precompileNearChunks(g_ac.pos, 3200.0f);
 }
 
 // Yamanlar, Dumanlidag ve Balcova yamaclarinda ridge/termal kaldirma (updraft) hesabi
@@ -5847,17 +7660,35 @@ static float computeRidgeAndThermalLift(const Vec3& pos) {
 }
 
 static void spawnCrashParticles(const Vec3& p) {
-    Rng r((uint32_t)( std::fabs(p.x * 13.0f + p.z * 37.0f) ) + 1u);
-    for (int i = 0; i < 90; i++) {
-        SmokePoint sp;
-        sp.pos = p + Vec3(r.range(-2.0f, 2.0f), r.range(0.0f, 2.0f), r.range(-2.0f, 2.0f));
-        sp.vel = Vec3(r.range(-22.0f, 22.0f), r.range(6.0f, 32.0f), r.range(-22.0f, 22.0f));
-        sp.maxLife = r.range(1.2f, 3.2f);
-        sp.life = sp.maxLife;
-        if (i & 1) { sp.r = 1.0f; sp.g = 0.65f; sp.b = 0.12f; sp.size = 4.5f; } // Kivilcim
-        else       { sp.r = 0.18f; sp.g = 0.18f; sp.b = 0.20f; sp.size = 7.5f; } // Siyah duman
-        g_particles.push_back(sp);
+    bool hitBldg = checkAircraftBuildingCollision100m(p, g_ac.pos, 2.6f);
+    bool hitWater = (!hitBldg && sampleSignedSeaDist(p.x, p.z) < -4.0f && p.y < 3.0f);
+    Vec3 surfN(0.0f, 1.0f, 0.0f);
+    if (hitBldg) {
+        int bIdx = findBuildingHitPoint(p, 2.6f);
+        if (bIdx >= 0) surfN = bldgSurfaceNormalAt(g_allBuildings[bIdx], p);
+    } else if (!hitWater) {
+        surfN = sampleTerrainNormal(p.x, p.z);
     }
+    spawnExplosionAt(p, surfN, hitBldg ? 30.0f : 26.0f, true, hitBldg, hitWater);
+}
+
+static bool checkAircraftCrashBuildings100m(const AircraftSpec& spec) {
+    refreshActiveColliders100m(g_ac.pos);
+    if (g_activeColliders100m.empty()) return false;
+    Vec3 testPts[4] = {
+        g_ac.pos,
+        g_ac.pos + g_ac.fwd * 4.2f,
+        g_ac.pos - g_ac.right * (spec.wingSpan * 0.45f),
+        g_ac.pos + g_ac.right * (spec.wingSpan * 0.45f)
+    };
+    for (int k = 0; k < 4; k++) {
+        if (checkAircraftBuildingCollision100m(testPts[k], g_ac.pos, 1.85f)) {
+            g_ac.crashed = true;
+            spawnCrashParticles(testPts[k]);
+            return true;
+        }
+    }
+    return false;
 }
 
 // PHYS_DT = 1.0f/240.0f alt-adimli 6-DOF aerodinamik fizik adimi
@@ -5873,7 +7704,12 @@ static void stepFlightPhysicsSubstep(float dt) {
     g_ac.flapDeg += clampf(targetFlap - g_ac.flapDeg, -25.0f * dt, 25.0f * dt);
     g_ac.propAngle = wrapAngle(g_ac.propAngle + (35.0f + g_ac.throttle * 140.0f) * dt);
 
-    // [F] Serbest Hizli Drone Modu
+    if (g_ac.crashed) {
+        g_ac.vel *= std::max(0.0f, 1.0f - 3.0f * dt);
+        return;
+    }
+
+    // [F] Serbest Hizli Drone Modu (binalara carpisma 100m icinde aktif)
     if (g_ac.droneMode) {
         float spd = 380.0f * (0.25f + g_ac.throttle * 1.4f);
         Vec3 wDrone = g_ac.right * (g_ac.pitchInput * 1.6f)
@@ -5885,17 +7721,25 @@ static void stepFlightPhysicsSubstep(float dt) {
         orthonormalizeBasis(g_ac.right, g_ac.up, g_ac.fwd);
         g_ac.vel = g_ac.fwd * spd;
         g_ac.pos += g_ac.vel * dt;
+        g_ac.pos.x = clampf(g_ac.pos.x, WORLD_X0 + 150.0f, WORLD_X1 - 150.0f);
+        g_ac.pos.z = clampf(g_ac.pos.z, WORLD_Z0 + 150.0f, WORLD_Z1 - 150.0f);
         float terrY = std::max(0.0f, sampleTerrainElev(g_ac.pos.x, g_ac.pos.z));
-        if (g_ac.pos.y < terrY + 2.0f) g_ac.pos.y = terrY + 2.0f;
+        if (g_ac.pos.y < terrY + 0.85f) {
+            if (g_ac.vel.y < -14.0f || sampleSignedSeaDist(g_ac.pos.x, g_ac.pos.z) < -5.0f) {
+                g_ac.crashed = true;
+                g_ac.pos.y = terrY + 0.90f;
+                spawnCrashParticles(g_ac.pos);
+            } else {
+                g_ac.pos.y = terrY + 1.25f;
+            }
+        }
         g_ac.airspeedMs = spd;
         g_ac.vsiMs = g_ac.vel.y;
         g_ac.aglM = g_ac.pos.y - terrY;
         g_ac.gLoad = 1.0f;
-        return;
-    }
-
-    if (g_ac.crashed) {
-        g_ac.vel *= std::max(0.0f, 1.0f - 3.0f * dt);
+        if (!g_ac.crashed) {
+            checkAircraftCrashBuildings100m(spec);
+        }
         return;
     }
 
@@ -6148,18 +7992,7 @@ static void stepFlightPhysicsSubstep(float dt) {
         }
     }
     if (!g_ac.crashed) {
-        Vec3 testPts[3] = {
-            g_ac.pos + g_ac.fwd * 4.0f,
-            g_ac.pos - g_ac.right * (spec.wingSpan * 0.45f),
-            g_ac.pos + g_ac.right * (spec.wingSpan * 0.45f)
-        };
-        for (int k = 0; k < 3; k++) {
-            if (checkBuildingCollision(testPts[k], 1.8f)) {
-                g_ac.crashed = true;
-                spawnCrashParticles(testPts[k]);
-                break;
-            }
-        }
+        checkAircraftCrashBuildings100m(spec);
     }
 }
 
@@ -6179,38 +8012,115 @@ static void updateParticlesAndSmoke(float dt) {
             sp.g = redRibbon ? 0.16f : 0.96f;
             sp.b = redRibbon ? 0.18f : 0.98f;
             sp.size = 3.8f;
-            g_particles.push_back(sp);
+            sp.growthRate = 1.4f;
+            sp.ptype = PT_SMOKE_RIBBON;
+            pushParticle(sp);
+        }
+    } else if (g_ac.crashed && !(sampleSignedSeaDist(g_ac.pos.x, g_ac.pos.z) < -4.0f && g_ac.pos.y < 3.0f)) {
+        // Kaza enkazindan cikan surekli siyah duman + kivilcimli alevler
+        g_smokeEmitTimer += dt;
+        if (g_smokeEmitTimer >= 0.07f) {
+            g_smokeEmitTimer = 0.0f;
+            g_weaponVfxSeq += 19u;
+            Rng r(g_weaponVfxSeq);
+            SmokePoint sm;
+            sm.pos = g_ac.pos + Vec3(r.range(-2.0f, 2.0f), 1.2f, r.range(-2.0f, 2.0f));
+            sm.vel = Vec3(r.range(-1.5f, 1.5f), r.range(7.0f, 12.0f), r.range(-1.5f, 1.5f));
+            sm.maxLife = r.range(2.2f, 3.8f);
+            sm.life = sm.maxLife;
+            sm.r = 0.14f; sm.g = 0.14f; sm.b = 0.16f;
+            sm.size = r.range(4.2f, 6.8f);
+            sm.growthRate = 3.2f;
+            sm.ptype = PT_BLACK_SMOKE;
+            pushParticle(sm);
+
+            SmokePoint fl;
+            fl.pos = g_ac.pos + Vec3(r.range(-1.5f, 1.5f), 0.6f, r.range(-1.5f, 1.5f));
+            fl.vel = Vec3(r.range(-1.2f, 1.2f), r.range(4.0f, 7.5f), r.range(-1.2f, 1.2f));
+            fl.maxLife = r.range(0.35f, 0.70f);
+            fl.life = fl.maxLife;
+            fl.r = 1.0f; fl.g = r.range(0.38f, 0.78f); fl.b = 0.08f;
+            fl.size = r.range(3.2f, 5.2f);
+            fl.growthRate = 2.0f;
+            fl.ptype = PT_FLAME;
+            pushParticle(fl);
         }
     }
+
     for (size_t i = 0; i < g_particles.size();) {
-        g_particles[i].life -= dt;
-        if (g_particles[i].life <= 0.0f) {
+        SmokePoint& pt = g_particles[i];
+        pt.life -= dt;
+        if (pt.life <= 0.0f) {
             g_particles[i] = g_particles.back();
             g_particles.pop_back();
-        } else {
-            g_particles[i].pos += g_particles[i].vel * dt;
-            g_particles[i].size += 1.4f * dt;
-            i++;
+            continue;
         }
+        if (pt.ptype == PT_SPARK || pt.ptype == PT_WATER_SPRAY) {
+            pt.vel.y -= 9.81f * dt;
+            pt.vel *= std::max(0.0f, 1.0f - 0.55f * dt);
+        } else if (pt.ptype == PT_BLACK_SMOKE || pt.ptype == PT_FLAME) {
+            pt.vel.x *= std::max(0.0f, 1.0f - 1.25f * dt);
+            pt.vel.z *= std::max(0.0f, 1.0f - 1.25f * dt);
+            pt.vel.y += (pt.ptype == PT_FLAME ? 4.8f : 2.6f) * dt;
+        }
+        pt.pos += pt.vel * dt;
+        pt.size += pt.growthRate * dt;
+        i++;
     }
 }
 
-static void renderParticles() {
+static void renderParticles(const Vec3& camRight, const Vec3& camUp) {
     if (g_particles.empty()) return;
-    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_CULL_FACE);
     glDisable(GL_LIGHTING);
+    glDepthMask(GL_FALSE);
     glEnable(GL_BLEND);
+
+    // 1. Yumusak duman, akrobasi duman izi ve su sicaği billboardlari (alpha blend)
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, g_texParticle);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glPointSize(6.0f);
+    glBegin(GL_QUADS);
+    for (const auto& p : g_particles) {
+        if (p.ptype == PT_FLAME || p.ptype == PT_SPARK) continue;
+        float a = clampf(p.life / p.maxLife, 0.0f, 1.0f);
+        float alphaMul = (p.ptype == PT_SMOKE_RIBBON) ? 0.65f : 0.72f;
+        glColor4f(p.r, p.g, p.b, a * alphaMul);
+        drawBillboardQuad3D(p.pos, camRight, camUp, p.size * 0.55f);
+    }
+    glEnd();
+
+    // 2. Parlak alev partikulleri (yumusak dairesel additive blend, sis kapali)
+    bool hadFog = (glIsEnabled(GL_FOG) != GL_FALSE);
+    glDisable(GL_FOG);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glBegin(GL_QUADS);
+    for (const auto& p : g_particles) {
+        if (p.ptype != PT_FLAME) continue;
+        float a = clampf(p.life / p.maxLife, 0.0f, 1.0f);
+        float inten = a * a;
+        glColor4f(p.r * inten, p.g * inten, p.b * inten, 1.0f);
+        drawBillboardQuad3D(p.pos, camRight, camUp, p.size * 0.52f);
+    }
+    glEnd();
+
+    // 3. Ucan kivilcim ve sicak enkaz parcalari
+    glDisable(GL_TEXTURE_2D);
+    glPointSize(4.5f);
     glBegin(GL_POINTS);
     for (const auto& p : g_particles) {
+        if (p.ptype != PT_SPARK) continue;
         float a = clampf(p.life / p.maxLife, 0.0f, 1.0f);
-        glColor4f(p.r, p.g, p.b, a * 0.82f);
+        glColor4f(p.r * a, p.g * a, p.b * a, 1.0f);
         glVertex3f(p.pos.x, p.pos.y, p.pos.z);
     }
     glEnd();
+
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
     glEnable(GL_LIGHTING);
+    if (hadFog) glEnable(GL_FOG);
 }
 // =====================================================================================
 //  BOLUM 8 : AVIYONIK HUD, SAG UST 2D WGS84 RADAR, /dev/input/js0 JOYSTICK VE X11/GLX
@@ -6517,12 +8427,75 @@ static void renderAvionicsHUD(int winW, int winH, float fps) {
     glEnd();
     glPopMatrix();
 
+    // 1. Silah Nisangahi (renderScene3D icinde guncellenen g_gunAim / g_ccip verisi)
+
     // Ucak referans nisangahi (Aircraft Bore Sight W-sembolu) + Flight Path Marker (FPM)
     glColor3f(0.25f, 1.0f, 0.50f);
     glBegin(GL_LINE_STRIP);
     glVertex2f(cx - 24, cy); glVertex2f(cx - 10, cy); glVertex2f(cx - 5, cy + 6);
     glVertex2f(cx, cy); glVertex2f(cx + 5, cy + 6); glVertex2f(cx + 10, cy); glVertex2f(cx + 24, cy);
     glEnd();
+
+    float gunScreenX = cx, gunScreenY = cy;
+    bool hasGunScreen = (!g_ac.crashed && g_gunAimValid && projectWorldToHUD(g_gunAimPos, gunScreenX, gunScreenY));
+    if (hasGunScreen) {
+        if (g_gunAimHitBldg) glColor3f(1.0f, 0.30f, 0.16f);
+        else                 glColor3f(0.28f, 1.0f, 0.85f);
+        glBegin(GL_LINE_LOOP);
+        for (int i = 0; i < 16; i++) {
+            float a = i * (2.0f * PI_F / 16.0f);
+            glVertex2f(gunScreenX + std::cos(a) * 15.0f, gunScreenY + std::sin(a) * 15.0f);
+        }
+        glEnd();
+        glBegin(GL_LINES);
+        glVertex2f(gunScreenX - 22.0f, gunScreenY); glVertex2f(gunScreenX - 9.0f, gunScreenY);
+        glVertex2f(gunScreenX + 9.0f,  gunScreenY); glVertex2f(gunScreenX + 22.0f, gunScreenY);
+        glVertex2f(gunScreenX, gunScreenY - 22.0f); glVertex2f(gunScreenX, gunScreenY - 9.0f);
+        glVertex2f(gunScreenX, gunScreenY + 9.0f);  glVertex2f(gunScreenX, gunScreenY + 22.0f);
+        glEnd();
+        glPointSize(3.5f);
+        glBegin(GL_POINTS);
+        glVertex2f(gunScreenX, gunScreenY);
+        glEnd();
+        if (g_gunAimHitBldg && g_gunAimDist < 1900.0f) {
+            char rngBuf[32];
+            std::snprintf(rngBuf, sizeof(rngBuf), "%.0fM", g_gunAimDist);
+            drawText2D(gunScreenX + 19.0f, gunScreenY - 5.0f, 1.25f, rngBuf, 1.0f, 0.45f, 0.22f);
+        }
+    }
+
+    float ccipX = cx, ccipY = cy;
+    if (!g_ac.crashed && g_ccipValid && projectWorldToHUD(g_ccipPos, ccipX, ccipY)) {
+        // Bomb fall-line (Kesikli dusus cizgisi) + CCIP Vurus Noktasi Pipper'i
+        glEnable(GL_LINE_STIPPLE);
+        glLineStipple(2, 0x0F0F);
+        glColor3f(1.0f, 0.82f, 0.18f);
+        glBegin(GL_LINES);
+        glVertex2f(hasGunScreen ? gunScreenX : cx, hasGunScreen ? gunScreenY : cy);
+        glVertex2f(ccipX, ccipY);
+        glEnd();
+        glDisable(GL_LINE_STIPPLE);
+
+        if (g_ccipHitBldg) glColor3f(1.0f, 0.22f, 0.14f);
+        else               glColor3f(1.0f, 0.82f, 0.18f);
+        glBegin(GL_LINE_LOOP);
+        for (int i = 0; i < 16; i++) {
+            float a = i * (2.0f * PI_F / 16.0f);
+            glVertex2f(ccipX + std::cos(a) * 12.0f, ccipY + std::sin(a) * 12.0f);
+        }
+        glEnd();
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(ccipX, ccipY - 17.0f);
+        glVertex2f(ccipX + 17.0f, ccipY);
+        glVertex2f(ccipX, ccipY + 17.0f);
+        glVertex2f(ccipX - 17.0f, ccipY);
+        glEnd();
+        char ccipBuf[48];
+        if (g_ccipHitBldg) std::snprintf(ccipBuf, sizeof(ccipBuf), "BINA %.1fs", g_ccipFallTime);
+        else               std::snprintf(ccipBuf, sizeof(ccipBuf), "BOMBA %.1fs", g_ccipFallTime);
+        drawText2D(ccipX + 20.0f, ccipY - 5.0f, 1.25f, ccipBuf,
+                   1.0f, g_ccipHitBldg ? 0.35f : 0.85f, g_ccipHitBldg ? 0.22f : 0.22f);
+    }
 
     float rawFpmX = clampf(g_ac.betaDeg * 5.0f, -120.0f, 120.0f);
     float rawFpmY = clampf(g_ac.alphaDeg * 6.5f, -120.0f, 120.0f);
@@ -6608,15 +8581,17 @@ static void renderAvionicsHUD(int winW, int winH, float fps) {
 
     const char* camNames[4] = {"CHASE", "KOKPIT HUD", "KANAT", "KULE"};
     const char* todNames[3] = {"GUNDUZ", "KIZIL KORFEZ GUNBATIMI", "GECE PARLAYAN SEHIR"};
-    std::snprintf(buf, sizeof(buf), "GEAR[G]: %s  FLAP[H]: %d°  DUMAN[B]: %s  OTOPILOT[P]: %s  TUR[I]: %s  DRONE[F]: %s  KAMERA[C]: %s  VAKIT[T]: %s  FPS: %.0f",
+    float maxFireSec = 0.0f;
+    for (const auto& fz : g_activeFires) maxFireSec = std::max(maxFireSec, fz.timeLeft);
+    std::snprintf(buf, sizeof(buf), "GEAR[G]: %s  FLAP[H]: %d°  DUMAN[B]: %s  DRONE[F]: %s  KAMERA[C]: %s  VAKIT[T]: %s  YANGIN: %zu (%ds)  FPS: %.0f",
                   g_ac.gearDown ? "ACIK" : "KAPALI", (int)g_ac.flapDeg,
-                  g_ac.smokeOn ? "ACIK" : "KAPALI", g_ac.autopilot ? "AKTIF" : "KAPALI",
-                  g_tourActive ? "AKTIF" : "KAPALI",
-                  g_ac.droneMode ? "AKTIF" : "KAPALI", camNames[g_camMode], todNames[g_timeOfDay], fps);
+                  g_ac.smokeOn ? "ACIK" : "KAPALI",
+                  g_ac.droneMode ? "AKTIF" : "KAPALI", camNames[g_camMode], todNames[g_timeOfDay],
+                  g_activeFires.size(), (int)std::ceil(maxFireSec), fps);
     drawText2D(18, winH - 42, 1.35f, buf, 0.80f, 0.95f, 0.85f);
 
     drawText2D(18, winH - 22, 1.3f,
-               "[1]LTBJ [2]Konak [3]Alsancak [4]Bayrakli [5]Karsiyaka [6]LTBL [I]Otonom Tur [V]Ucak [R]Kurtar",
+               "[1-6]Bolge  [J/Enter/RB]Mermi  [M/U/LB]Bomba(30s Yangin)  [F]Drone  [I]Tur  [V]Ucak  [R]Kurtar",
                0.65f, 0.88f, 1.0f);
 
     if (g_tourActive) {
@@ -6662,6 +8637,8 @@ static float g_jsRetryTimer = 0.0f;
 
 static void resetAndRecoverAircraftInAir() {
     g_ac.crashed = false;
+    g_camShakeMag = 0.0f;
+    g_camShakeTimer = 0.0f;
     float terr = std::max(0.0f, sampleTerrainElev(g_ac.pos.x, g_ac.pos.z));
     if (g_ac.pos.y < terr + 60.0f) {
         g_ac.pos.y = terr + 220.0f;
@@ -6748,9 +8725,11 @@ static void pollLinuxJoystick(float dt) {
             g_jsBtn[ev.number] = pressed;
             if (!isInit && pressed) {
                 // F710 / Xbox tus atamalari:
-                // 2 (X): Flap | 3 (Y): Kamera | 6 (Back): Ucak Degistir | 7 (Start): Kurtar [R] | 8/9: Duman | 10: Gear
+                // 2 (X): Flap | 3 (Y): Kamera | 4 (LB): Bomba At | 5 (RB): Mermi At | 6 (Back): Ucak | 7 (Start): Kurtar | 8/9: Duman | 10: Gear
                 if (ev.number == 2) g_ac.flapStage = (g_ac.flapStage + 1) % 3;
                 else if (ev.number == 3) g_camMode = (g_camMode + 1) % NUM_CAMS;
+                else if (ev.number == 4) g_bombTriggerEdge = true;
+                else if (ev.number == 5) g_gunTriggerEdge = true;
                 else if (ev.number == 6) cycleAircraftType();
                 else if (ev.number == 7) resetAndRecoverAircraftInAir();
                 else if (ev.number == 8 || ev.number == 9) g_ac.smokeOn = !g_ac.smokeOn;
@@ -6761,47 +8740,287 @@ static void pollLinuxJoystick(float dt) {
 }
 
 // =====================================================================================
-//  EGE IKLIMI, GUNES / KIZIL GUNBATIMI / GECE YILDIZ KUBBESI VE 3D KUMULUS BULUTLARI
+//  EGE IKLIMI, COK-BANTLI ATMOSFER KUBBESI, AY + YILDIZLAR + 3D KUMULUS BULUTLARI
 // =====================================================================================
-static void renderSkyAndClimate3D(float simTime, const Vec3& eye) {
+static bool g_headlessTour = false;
+
+static void precompileNearChunks(const Vec3& focusPos, float radius) {
+    float r2 = radius * radius;
+    for (int i = 0; i < CHUNK_NX * CHUNK_NZ; i++) {
+        CityChunk& ck = g_cityChunks[i];
+        if (ck.compiled) continue;
+        float dx = ck.cx - focusPos.x, dz = ck.cz - focusPos.z;
+        if (dx * dx + dz * dz <= r2) {
+            compileChunkIfNeeded(ck);
+        }
+    }
+}
+
+static inline Vec3 getCelestialSunMoonDir() {
+    if (g_timeOfDay == 2) return norm(Vec3(0.42f, 0.27f, -0.86f));   // Ay: NNE Korfez / Bayrakli ufku uzerinde
+    if (g_timeOfDay == 1) return norm(Vec3(-0.88f, 0.19f, 0.12f));  // Gunbatimi: Bati Korfez ufku
+    return norm(Vec3(-0.45f, 0.74f, 0.40f));                        // Gunduz gunesi
+}
+
+static void renderAtmosphereDome3D(const Vec3& eye, const Vec3& sunDir) {
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_FOG);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_CULL_FACE);
+
+    // 5 irtifa bandi: ufuk alti -> ufuk parlakligi -> alcak gok -> orta gok -> zenit
+    const float elevs[5] = {-0.18f, 0.00f, 0.14f, 0.44f, 1.00f};
+    float baseCol[5][3];
+    if (g_timeOfDay == 2) {
+        // Gece Ege sema kubbesi (ufukta sıcak Izmir sehir isik halesi + koyu lacivert zenit)
+        const float nCol[5][3] = {
+            {0.05f, 0.07f, 0.13f}, {0.09f, 0.11f, 0.21f}, {0.04f, 0.07f, 0.16f},
+            {0.02f, 0.04f, 0.10f}, {0.01f, 0.02f, 0.06f}
+        };
+        std::memcpy(baseCol, nCol, sizeof(baseCol));
+    } else if (g_timeOfDay == 1) {
+        // Kizil Ege Korfezi gunbatimi kubbesi
+        const float sCol[5][3] = {
+            {0.76f, 0.40f, 0.28f}, {0.95f, 0.50f, 0.29f}, {0.82f, 0.42f, 0.39f},
+            {0.34f, 0.26f, 0.48f}, {0.13f, 0.15f, 0.34f}
+        };
+        std::memcpy(baseCol, sCol, sizeof(baseCol));
+    } else {
+        // Durgun Ege mavisi gunduz kubbesi
+        const float dCol[5][3] = {
+            {0.68f, 0.82f, 0.94f}, {0.72f, 0.86f, 0.96f}, {0.44f, 0.71f, 0.94f},
+            {0.24f, 0.52f, 0.86f}, {0.12f, 0.33f, 0.72f}
+        };
+        std::memcpy(baseCol, dCol, sizeof(baseCol));
+    }
+
+    const int SEG = 36;
+    const float domeR = 40000.0f;
+    Vec2 sunAz = norm2(Vec2(sunDir.x, sunDir.z));
+
+    auto emitSkyVertex = [&](int band, int segIdx) {
+        float az = (float)segIdx * (2.0f * PI_F / (float)SEG);
+        float ca = std::cos(az), sa = std::sin(az);
+        float sinE = elevs[band];
+        float cosE = std::sqrt(std::max(0.0f, 1.0f - sinE * sinE));
+        float r = baseCol[band][0], g = baseCol[band][1], b = baseCol[band][2];
+
+        // Gunes / Ay azimutu yonunde ufuk ve alcak gokte atmosferik sacilma isiltisi
+        float azMatch = std::max(0.0f, ca * sunAz.x + sa * sunAz.z);
+        float scatterW = std::pow(azMatch, (g_timeOfDay == 1) ? 2.4f : 4.0f) * std::max(0.0f, 1.0f - std::fabs(sinE) * 2.2f);
+        if (g_timeOfDay == 1) {
+            r = std::min(1.0f, r + scatterW * 0.24f);
+            g = std::min(1.0f, g + scatterW * 0.22f);
+            b = std::min(1.0f, b + scatterW * 0.08f);
+        } else if (g_timeOfDay == 0) {
+            r = std::min(1.0f, r + scatterW * 0.14f);
+            g = std::min(1.0f, g + scatterW * 0.11f);
+            b = std::min(1.0f, b + scatterW * 0.05f);
+        } else {
+            r = std::min(1.0f, r + scatterW * 0.05f);
+            g = std::min(1.0f, g + scatterW * 0.08f);
+            b = std::min(1.0f, b + scatterW * 0.15f);
+        }
+        glColor3f(r, g, b);
+        glVertex3f(eye.x + cosE * ca * domeR, eye.y + sinE * domeR, eye.z + cosE * sa * domeR);
+    };
+
+    for (int band = 0; band < 4; band++) {
+        glBegin(GL_QUAD_STRIP);
+        for (int s = 0; s <= SEG; s++) {
+            emitSkyVertex(band, s);
+            emitSkyVertex(band + 1, s);
+        }
+        glEnd();
+    }
+
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_FOG);
+    glEnable(GL_LIGHTING);
+}
+
+static void renderWaterShimmer3D(float simTime, const Vec3& eye, const Vec3& sunDir) {
+    Vec2 az = norm2(Vec2(sunDir.x, sunDir.z));
+    if (dot2(az, az) < 0.1f) return;
+    Vec2 perp(-az.z, az.x);
+
+    const float zeroFog[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float savedFog[4];
+    glGetFloatv(GL_FOG_COLOR, savedFog);
+    glFogfv(GL_FOG_COLOR, zeroFog);
+
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    glDepthMask(GL_FALSE);
+
+    float sR = 0.72f, sG = 0.88f, sB = 0.96f;
+    if (g_timeOfDay == 1) { sR = 1.00f; sG = 0.68f; sB = 0.28f; }
+    else if (g_timeOfDay == 2) { sR = 0.72f; sG = 0.84f; sB = 1.00f; }
+
+    for (int i = 0; i < 96; i++) {
+        float tNorm = (float)i / 96.0f;
+        float along = 140.0f + std::pow(tNorm, 1.35f) * 11500.0f;
+        float lateralJitter = std::sin(i * 2.37f + simTime * 1.1f) * (14.0f + tNorm * 135.0f)
+                            + std::cos(i * 4.13f - simTime * 0.8f) * (8.0f + tNorm * 45.0f);
+        Vec2 wc(eye.x + az.x * along + perp.x * lateralJitter,
+                eye.z + az.z * along + perp.z * lateralJitter);
+        if (wc.x < WORLD_X0 || wc.x > WORLD_X1 || wc.z < WORLD_Z0 || wc.z > WORLD_Z1) continue;
+        if (sampleSignedSeaDist(wc.x, wc.z) > -18.0f) continue;
+
+        float shimmer = std::max(0.0f, 0.35f + 0.65f * std::sin(simTime * (3.0f + (i % 5) * 0.8f) + i * 1.71f));
+        float distFade = (1.0f - tNorm * 0.55f) * shimmer * shimmer * 0.55f;
+        if (distFade < 0.02f) continue;
+
+        float hw = 16.0f + tNorm * 58.0f;
+        float hd = 2.6f + tNorm * 5.2f;
+        glBegin(GL_TRIANGLE_FAN);
+        glColor3f(sR * distFade, sG * distFade, sB * distFade);
+        glVertex3f(wc.x, 0.12f, wc.z);
+        glColor3f(0.0f, 0.0f, 0.0f);
+        for (int k = 0; k <= 8; k++) {
+            float a = k * (2.0f * PI_F / 8.0f);
+            Vec2 ep = wc + perp * (std::cos(a) * hw) + az * (std::sin(a) * hd);
+            glVertex3f(ep.x, 0.12f, ep.z);
+        }
+        glEnd();
+    }
+
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glFogfv(GL_FOG_COLOR, savedFog);
+    glEnable(GL_LIGHTING);
+}
+
+static void renderSkyAndClimate3D(float simTime, const Vec3& eye, const Vec3& sunDir) {
     glDisable(GL_LIGHTING);
     glDisable(GL_TEXTURE_2D);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    // 1. Gunes / Kizil Korfez Gunbatimi Diski veya Gece Ay + Yildiz Kubbesi
     glDepthMask(GL_FALSE);
+
+    // 1. Gok Cisimleri (Sis kapali iken keskin Ay, kraterli yuzey, tac, 1100+ yildiz veya Gunes)
+    glDisable(GL_FOG);
     if (g_timeOfDay == 2) {
-        // Gece yildizlari (kamera merkezli gokyuzu kubbesinde)
-        glPointSize(2.0f);
+        const float rad = 32000.0f;
+
+        // 1A. Samanyolu hafif parlak yildiz kusagi (320 soluk yildiz noktasi)
+        glPointSize(1.5f);
         glBegin(GL_POINTS);
-        for (int i = 0; i < 320; i++) {
+        for (int i = 0; i < 820; i++) {
             uint32_t h = hash2i(i * 73 + 19, i * 151 + 43);
-            float az = ((h & 1023) / 1023.0f) * 2.0f * PI_F;
-            float el = 0.14f + (((h >> 10) & 1023) / 1023.0f) * 1.32f;
-            float rad = 24000.0f;
-            float sx = eye.x + std::cos(el) * std::cos(az) * rad;
-            float sy = eye.y + std::sin(el) * rad;
-            float sz = eye.z + std::cos(el) * std::sin(az) * rad;
-            float tw = 0.65f + 0.35f * std::sin(simTime * 2.8f + i * 0.7f);
-            glColor4f(0.92f, 0.96f, 1.0f, tw);
-            glVertex3f(sx, sy, sz);
+            float az = ((h & 2047) / 2047.0f) * 2.0f * PI_F;
+            float u  = (((h >> 11) & 1023) / 1023.0f);
+            float el = 0.06f + std::pow(u, 0.85f) * 1.40f;
+            float cosE = std::cos(el);
+            float tw = 0.42f + 0.35f * std::sin(simTime * 1.9f + i * 0.71f);
+            float tint = ((h >> 21) & 15) / 15.0f;
+            glColor4f(lerpf(0.76f, 0.96f, tint), lerpf(0.84f, 0.94f, tint), lerpf(1.00f, 0.86f, tint), tw);
+            glVertex3f(eye.x + cosE * std::cos(az) * rad, eye.y + std::sin(el) * rad, eye.z + cosE * std::sin(az) * rad);
+        }
+        glEnd();
+
+        // 1B. Orta parlaklikta Ege gece yildizlari (230 adet)
+        glPointSize(2.6f);
+        glBegin(GL_POINTS);
+        for (int i = 0; i < 230; i++) {
+            uint32_t h = hash2i(i * 193 + 311, i * 89 + 577);
+            float az = ((h & 2047) / 2047.0f) * 2.0f * PI_F;
+            float el = 0.08f + (((h >> 11) & 1023) / 1023.0f) * 1.38f;
+            float cosE = std::cos(el);
+            float tw = 0.68f + 0.32f * std::sin(simTime * 2.9f + i * 1.13f);
+            bool warmStar = ((h >> 22) & 3) == 0;
+            glColor4f(warmStar ? 1.00f : 0.86f, warmStar ? 0.91f : 0.94f, warmStar ? 0.74f : 1.00f, tw);
+            glVertex3f(eye.x + cosE * std::cos(az) * rad, eye.y + std::sin(el) * rad, eye.z + cosE * std::sin(az) * rad);
+        }
+        glEnd();
+
+        // 1C. Parlak ana takim yildizlari (55 adet)
+        glPointSize(3.8f);
+        glBegin(GL_POINTS);
+        for (int i = 0; i < 55; i++) {
+            uint32_t h = hash2i(i * 409 + 701, i * 251 + 919);
+            float az = ((h & 2047) / 2047.0f) * 2.0f * PI_F;
+            float el = 0.12f + (((h >> 11) & 1023) / 1023.0f) * 1.30f;
+            float cosE = std::cos(el);
+            float tw = 0.80f + 0.20f * std::sin(simTime * 3.6f + i * 1.7f);
+            bool blueGiant = ((h >> 22) & 1) == 0;
+            glColor4f(blueGiant ? 0.84f : 1.00f, blueGiant ? 0.93f : 0.92f, blueGiant ? 1.00f : 0.72f, tw);
+            glVertex3f(eye.x + cosE * std::cos(az) * rad, eye.y + std::sin(el) * rad, eye.z + cosE * std::sin(az) * rad);
+        }
+        glEnd();
+
+        // 1D. Gece Dolunay + Kraterli Ay Denizleri (Lunar Maria) + Gumus Atmosferik Tac
+        Vec3 moonC = eye + sunDir * 31500.0f;
+        Vec3 rightV = norm(cross(sunDir, Vec3(0.0f, 1.0f, 0.0f)));
+        Vec3 orthoUp = norm(cross(rightV, sunDir));
+
+        // Dis gumus-mavi corona halesi
+        glBlendFunc(GL_ONE, GL_ONE);
+        const float haloR = 3100.0f;
+        glBegin(GL_TRIANGLE_FAN);
+        glColor3f(0.18f, 0.24f, 0.36f);
+        glVertex3f(moonC.x, moonC.y, moonC.z);
+        for (int i = 0; i <= 32; i++) {
+            float a = i * (2.0f * PI_F / 32.0f);
+            Vec3 p = moonC + (rightV * std::cos(a) + orthoUp * std::sin(a)) * haloR;
+            glColor3f(0.0f, 0.0f, 0.0f);
+            glVertex3f(p.x, p.y, p.z);
+        }
+        glEnd();
+
+        // Ay diski (krater/maria golgeli 2 halkali detay)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        const float moonR = 920.0f;
+        auto emitMoonPt = [&](float lx, float ly, float rimScale) {
+            float maria = std::sin(lx * 3.6f + 0.5f) * std::cos(ly * 3.2f - 0.3f)
+                        + 0.55f * std::cos((lx - ly) * 5.2f + 1.1f);
+            float shade = clampf(0.84f + 0.13f * maria, 0.68f, 0.99f) * rimScale;
+            // Hafif gibbous faz golgesi (sol alt kenarda yumusak terminator)
+            float phase = clampf(0.86f + 0.22f * (lx * 0.72f + ly * 0.45f), 0.56f, 1.04f);
+            float br = shade * phase;
+            glColor4f(std::min(1.0f, br * 1.00f), std::min(1.0f, br * 0.98f), std::min(1.0f, br * 0.90f), 1.0f);
+            Vec3 p = moonC + (rightV * lx + orthoUp * ly) * moonR;
+            glVertex3f(p.x, p.y, p.z);
+        };
+        glBegin(GL_TRIANGLES);
+        const int MSEG = 32;
+        const float midR = 0.56f;
+        for (int i = 0; i < MSEG; i++) {
+            float a0 = i * (2.0f * PI_F / MSEG);
+            float a1 = (i + 1) * (2.0f * PI_F / MSEG);
+            float c0 = std::cos(a0), s0 = std::sin(a0);
+            float c1 = std::cos(a1), s1 = std::sin(a1);
+            // Ic halka
+            emitMoonPt(0.0f, 0.0f, 1.00f);
+            emitMoonPt(c0 * midR, s0 * midR, 0.96f);
+            emitMoonPt(c1 * midR, s1 * midR, 0.96f);
+            // Dis halka
+            emitMoonPt(c0 * midR, s0 * midR, 0.96f);
+            emitMoonPt(c0, s0, 0.84f);
+            emitMoonPt(c1, s1, 0.84f);
+
+            emitMoonPt(c0 * midR, s0 * midR, 0.96f);
+            emitMoonPt(c1, s1, 0.84f);
+            emitMoonPt(c1 * midR, s1 * midR, 0.96f);
         }
         glEnd();
     } else {
-        // Gunes veya Kizil Korfez Gunbatimi diski (Bati-Guneybati Korfez ufku uzerinde)
-        Vec3 sunDir = (g_timeOfDay == 1) ? norm(Vec3(-0.88f, 0.19f, 0.12f)) : norm(Vec3(-0.45f, 0.74f, 0.40f));
-        Vec3 sunC = eye + sunDir * 24500.0f;
-        Vec3 upV(0.0f, 1.0f, 0.0f);
-        Vec3 rightV = norm(cross(sunDir, upV));
+        // Gunes veya Kizil Korfez Gunbatimi diski + atmosferik hale
+        Vec3 sunC = eye + sunDir * 31500.0f;
+        Vec3 rightV = norm(cross(sunDir, Vec3(0.0f, 1.0f, 0.0f)));
         Vec3 orthoUp = norm(cross(rightV, sunDir));
-        float diskR = (g_timeOfDay == 1) ? 1650.0f : 1100.0f;
+        float diskR = (g_timeOfDay == 1) ? 2150.0f : 1380.0f;
         glBegin(GL_TRIANGLE_FAN);
-        if (g_timeOfDay == 1) glColor4f(1.0f, 0.86f, 0.42f, 0.96f);
-        else glColor4f(1.0f, 0.99f, 0.88f, 0.96f);
+        if (g_timeOfDay == 1) glColor4f(1.0f, 0.90f, 0.48f, 0.98f);
+        else glColor4f(1.0f, 0.99f, 0.90f, 0.98f);
         glVertex3f(sunC.x, sunC.y, sunC.z);
-        for (int i = 0; i <= 24; i++) {
-            float a = i * (2.0f * PI_F / 24.0f);
+        for (int i = 0; i <= 28; i++) {
+            float a = i * (2.0f * PI_F / 28.0f);
             Vec3 p = sunC + (rightV * std::cos(a) + orthoUp * std::sin(a)) * diskR;
             if (g_timeOfDay == 1) glColor4f(1.0f, 0.36f, 0.12f, 0.0f);
             else glColor4f(1.0f, 0.94f, 0.68f, 0.0f);
@@ -6810,10 +9029,21 @@ static void renderSkyAndClimate3D(float simTime, const Vec3& eye) {
         glEnd();
     }
 
-    // 2. Ege Imbat Ruzgariyla Suruklenen Yumusak Kubbeli 3D Kumulus Bulutlari (1680m..2250m irtifa)
-    float cR = 0.98f, cG = 0.99f, cB = 1.00f, cA = 0.42f;
-    if (g_timeOfDay == 1) { cR = 1.0f; cG = 0.72f; cB = 0.52f; cA = 0.46f; }
-    else if (g_timeOfDay == 2) { cR = 0.18f; cG = 0.22f; cB = 0.34f; cA = 0.32f; }
+    // 2. Ege Imbat Ruzgariyla Suruklenen Katmanli 3D Kumulus Bulutlari (1680m..2250m irtifa)
+    glEnable(GL_FOG);
+    float cTopR = 0.99f, cTopG = 0.99f, cTopB = 1.00f, cBotR = 0.78f, cBotG = 0.83f, cBotB = 0.90f, cA = 0.46f;
+    if (g_timeOfDay == 1) {
+        cTopR = 1.00f; cTopG = 0.76f; cTopB = 0.54f;
+        cBotR = 0.76f; cBotG = 0.44f; cBotB = 0.40f; cA = 0.50f;
+    } else if (g_timeOfDay == 2) {
+        cTopR = 0.22f; cTopG = 0.28f; cTopB = 0.42f;
+        cBotR = 0.10f; cBotG = 0.13f; cBotB = 0.22f; cA = 0.32f;
+    }
+
+    static const float puffDx[5] = {-0.38f, -0.16f, 0.02f, 0.22f, 0.40f};
+    static const float puffDz[5] = { 0.12f, -0.16f, 0.00f, 0.15f,-0.10f};
+    static const float puffH[5]  = {36.0f,  52.0f,  68.0f, 54.0f, 34.0f};
+    static const float puffS[5]  = {0.42f,  0.54f,  0.64f, 0.52f, 0.40f};
 
     for (int c = 0; c < 48; c++) {
         uint32_t h = hash2i(c * 41 + 7, c * 97 + 13);
@@ -6825,21 +9055,21 @@ static void renderSkyAndClimate3D(float simTime, const Vec3& eye) {
         float cy = 1680.0f + (c % 6) * 95.0f;
         float cw = 480.0f + (c % 5) * 110.0f;
         float cd = 360.0f + (c % 4) * 90.0f;
-        if (len2(Vec2(cx - eye.x, cz - eye.z)) > 23000.0f) continue;
+        float ddx = cx - eye.x, ddz = cz - eye.z;
+        if (ddx * ddx + ddz * ddz > 24000.0f * 24000.0f) continue;
 
-        for (int puff = -1; puff <= 1; puff++) {
-            float px = cx + puff * (cw * 0.32f);
-            float pz = cz + (puff & 1) * (cd * 0.20f);
-            float py = cy + (1 - std::abs(puff)) * 28.0f;
-            float rx = cw * (0.58f - 0.10f * std::abs(puff));
-            float rz = cd * (0.58f - 0.10f * std::abs(puff));
-            // Yumusak kenarli kumulus kubbesi (merkezde opak, dis kenarda 0 alfa)
+        for (int p = 0; p < 5; p++) {
+            float px = cx + puffDx[p] * cw;
+            float pz = cz + puffDz[p] * cd;
+            float py = cy + (2 - std::abs(p - 2)) * 12.0f;
+            float rx = cw * puffS[p];
+            float rz = cd * puffS[p];
             glBegin(GL_TRIANGLE_FAN);
-            glColor4f(cR, cG, cB, cA);
-            glVertex3f(px, py + 42.0f, pz);
+            glColor4f(cTopR, cTopG, cTopB, cA);
+            glVertex3f(px, py + puffH[p], pz);
             for (int k = 0; k <= 12; k++) {
                 float a = k * (2.0f * PI_F / 12.0f);
-                glColor4f(cR * 0.92f, cG * 0.93f, cB * 0.96f, 0.0f);
+                glColor4f(cBotR, cBotG, cBotB, 0.0f);
                 glVertex3f(px + std::cos(a) * rx, py, pz + std::sin(a) * rz);
             }
             glEnd();
@@ -6857,22 +9087,24 @@ static void renderSkyAndClimate3D(float simTime, const Vec3& eye) {
 static void renderScene3D(int winW, int winH, float simTime) {
     glViewport(0, 0, winW, winH);
 
-    // Gündüz / Kızıl Körfez Günbatımı / Gece Parlayan Şehir atmosfer renkleri
-    float skyR = 0.42f, skyG = 0.68f, skyB = 0.94f;
-    float sunAmb[4]  = {0.42f, 0.44f, 0.48f, 1.0f};
-    float sunDiff[4] = {0.96f, 0.94f, 0.88f, 1.0f};
-    float sunPos[4]  = {-0.45f, 0.78f, 0.42f, 0.0f};
+    // Gündüz / Kızıl Körfez Günbatımı / Gece Ay Işığı & Parlayan Şehir atmosfer renkleri
+    Vec3 sunDir = getCelestialSunMoonDir();
+    float skyR = 0.66f, skyG = 0.81f, skyB = 0.93f;
+    float sunAmb[4]  = {0.42f, 0.44f, 0.49f, 1.0f};
+    float sunDiff[4] = {0.98f, 0.95f, 0.88f, 1.0f};
+    float sunPos[4]  = {sunDir.x, sunDir.y, sunDir.z, 0.0f};
+    float modelAmb[4] = {0.06f, 0.06f, 0.08f, 1.0f};
     if (g_timeOfDay == 1) {
         // Kizil Korfez Gunbatimi
-        skyR = 0.86f; skyG = 0.42f; skyB = 0.28f;
-        sunAmb[0] = 0.48f; sunAmb[1] = 0.32f; sunAmb[2] = 0.28f;
-        sunDiff[0] = 1.0f; sunDiff[1] = 0.58f; sunDiff[2] = 0.32f;
-        sunPos[0] = -0.88f; sunPos[1] = 0.24f; sunPos[2] = 0.15f;
+        skyR = 0.88f; skyG = 0.48f; skyB = 0.32f;
+        sunAmb[0] = 0.44f; sunAmb[1] = 0.28f; sunAmb[2] = 0.26f;
+        sunDiff[0] = 1.00f; sunDiff[1] = 0.56f; sunDiff[2] = 0.30f;
     } else if (g_timeOfDay == 2) {
-        // Gece Parlayan Sehir ve Pist Isiklari
-        skyR = 0.03f; skyG = 0.05f; skyB = 0.12f;
-        sunAmb[0] = 0.18f; sunAmb[1] = 0.20f; sunAmb[2] = 0.28f;
-        sunDiff[0] = 0.28f; sunDiff[1] = 0.34f; sunDiff[2] = 0.48f;
+        // Gece Parlayan Sehir ve Ay Isigi (dusuk baz isik -> parlayan pencere/fener kontrasti)
+        skyR = 0.05f; skyG = 0.07f; skyB = 0.15f;
+        sunAmb[0] = 0.05f; sunAmb[1] = 0.06f; sunAmb[2] = 0.12f;
+        sunDiff[0] = 0.12f; sunDiff[1] = 0.16f; sunDiff[2] = 0.28f;
+        modelAmb[0] = 0.0f; modelAmb[1] = 0.0f; modelAmb[2] = 0.0f;
     }
 
     glClearColor(skyR, skyG, skyB, 1.0f);
@@ -6880,13 +9112,13 @@ static void renderScene3D(int winW, int winH, float simTime) {
 
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluPerspective(62.0, (double)winW / (double)std::max(1, winH), 1.5, 36000.0);
+    double aspect = (double)winW / (double)std::max(1, winH);
+    gluPerspective(62.0, aspect, 1.5, 48000.0);
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
     // 4 Kamera Modu ([C]: Chase, Kokpit HUD, Kanat, Kule)
-    // Chase kamerada ucaga goreceli yumusatilmis yonelim kullanilarak titresim (jitter) sifirlanir
     g_camFwd = norm(lerpV(g_camFwd, g_ac.fwd, 0.14f));
     Vec3 targetCamUp = norm(lerpV(Vec3(0.0f, 1.0f, 0.0f), g_ac.up, 0.32f));
     g_camUp = norm(lerpV(g_camUp, targetCamUp, 0.14f));
@@ -6907,7 +9139,6 @@ static void renderScene3D(int winW, int winH, float simTime) {
         center = g_ac.pos + g_ac.fwd * 6.0f;
         upVec = g_ac.up;
     } else {
-        // Kule Kamerasi (En yakin LTBJ / Konak / LTBL kulesinden ucagi izler)
         Vec2 sk = geoPt(SAAT_LAT, SAAT_LON);
         eye = Vec3(sk.x, sampleTerrainElev(sk.x, sk.z) + 65.0f, sk.z);
         if (g_ac.pos.z > 8000.0f) {
@@ -6917,89 +9148,370 @@ static void renderScene3D(int winW, int winH, float simTime) {
         center = g_ac.pos;
         upVec = Vec3(0, 1, 0);
     }
+
+    // Darbe, patlama ve atis sirasinda kamera sarsintisi (ekran titremesi)
+    float shakeDt = clampf(simTime - g_lastShakeSimTime, 0.0f, 0.1f);
+    if (simTime < g_lastShakeSimTime) shakeDt = 0.016f;
+    g_lastShakeSimTime = simTime;
+    if (g_camShakeTimer > 0.0f && shakeDt > 0.0f) {
+        g_camShakeTimer = std::max(0.0f, g_camShakeTimer - shakeDt);
+        g_camShakePhase += shakeDt * 58.0f;
+    }
+    Vec3 baseFwd = norm(center - eye);
+    Vec3 baseRight = norm(cross(baseFwd, upVec));
+    Vec3 baseUp = norm(cross(baseRight, baseFwd));
+    if (g_camShakeTimer > 0.0f && g_camShakeDur > 0.0f) {
+        float env = clampf(g_camShakeTimer / g_camShakeDur, 0.0f, 1.0f);
+        float amp = g_camShakeMag * env * env;
+        float sx = std::sin(g_camShakePhase * 1.13f) + 0.5f * std::cos(g_camShakePhase * 2.71f);
+        float sy = std::cos(g_camShakePhase * 1.47f) + 0.5f * std::sin(g_camShakePhase * 3.19f);
+        float sr = std::sin(g_camShakePhase * 1.91f) * 0.045f * amp;
+        Vec3 shakeOff = baseRight * (sx * amp) + baseUp * (sy * amp);
+        eye += shakeOff;
+        center += shakeOff * 0.65f;
+        upVec = norm(baseUp + baseRight * sr);
+        baseFwd = norm(center - eye);
+        baseRight = norm(cross(baseFwd, upVec));
+        baseUp = norm(cross(baseRight, baseFwd));
+    }
+    g_lastCamEye = eye;
+    g_lastCamFwd = baseFwd;
+    g_lastCamRight = baseRight;
+    g_lastCamUp = baseUp;
+    g_lastWinW = winW;
+    g_lastWinH = winH;
+
     gluLookAt(eye.x, eye.y, eye.z, center.x, center.y, center.z, upVec.x, upVec.y, upVec.z);
 
-    // Perspektif sis ve gunes aydinlatmasi
+    // 0. Cok-Bantli Atmosfer Kubbesi (gok gecisi + gunes/ay sacilma isiltisi)
+    renderAtmosphereDome3D(eye, sunDir);
+
+    // Perspektif sis (ufuk rengiyle tam uyumlu) ve tek-tarafli hizli aydinlatma
     glEnable(GL_FOG);
     float fogCol[4] = {skyR, skyG, skyB, 1.0f};
     glFogfv(GL_FOG_COLOR, fogCol);
     glFogi(GL_FOG_MODE, GL_LINEAR);
-    glFogf(GL_FOG_START, 2500.0f);
-    glFogf(GL_FOG_END, 26000.0f);
+    glFogf(GL_FOG_START, 4800.0f);
+    glFogf(GL_FOG_END, 28000.0f);
 
     glEnable(GL_LIGHTING);
     glEnable(GL_LIGHT0);
-    glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE);
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, modelAmb);
+    glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_FALSE);
     glEnable(GL_COLOR_MATERIAL);
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
     glLightfv(GL_LIGHT0, GL_POSITION, sunPos);
     glLightfv(GL_LIGHT0, GL_AMBIENT, sunAmb);
     glLightfv(GL_LIGHT0, GL_DIFFUSE, sunDiff);
 
-    // 1. Arazi + Rihtim + IZBAN + Otoyollar + Simge Yapilar Display Lists
+    Vec2 camFwd2D = norm2(Vec2(center.x - eye.x, center.z - eye.z));
+    const float tileW = (WORLD_X1 - WORLD_X0) / (float)WORLD_TILE_N;
+    const float tileH = (WORLD_Z1 - WORLD_Z0) / (float)WORLD_TILE_N;
+    const float tileHalfDiag = 0.5f * std::sqrt(tileW * tileW + tileH * tileH) + 180.0f;
+
+    auto tileInFrustum = [&](float tcx, float tcz, float rad, float maxDist) -> bool {
+        float dx = tcx - eye.x, dz = tcz - eye.z;
+        float d2 = dx * dx + dz * dz;
+        float limit = maxDist + rad;
+        if (d2 > limit * limit) return false;
+        float along = dx * camFwd2D.x + dz * camFwd2D.z;
+        if (along < -rad - 300.0f) return false;
+        return true;
+    };
+
+    // 1. 8x8 Spatial Tile Arazi + Ufuk Etegi + Rihtim + Tile Otoyol + Raylar + Simge Yapilar
     glEnable(GL_TEXTURE_2D);
-    glCallList(g_dlTerrain);
+    if (g_dlHorizonApron) glCallList(g_dlHorizonApron);
+    for (int tz = 0; tz < WORLD_TILE_N; tz++) {
+        float tcz = WORLD_Z0 + (tz + 0.5f) * tileH;
+        for (int tx = 0; tx < WORLD_TILE_N; tx++) {
+            int tidx = tz * WORLD_TILE_N + tx;
+            if (!g_dlTerrainTile[tidx]) continue;
+            float tcx = WORLD_X0 + (tx + 0.5f) * tileW;
+            if (tileInFrustum(tcx, tcz, tileHalfDiag, 29000.0f)) {
+                glCallList(g_dlTerrainTile[tidx]);
+            }
+        }
+    }
     glCallList(g_dlQuayAndPromenade);
-    glCallList(g_dlIzbanAndRoads);
+    for (int tz = 0; tz < WORLD_TILE_N; tz++) {
+        float tcz = WORLD_Z0 + (tz + 0.5f) * tileH;
+        for (int tx = 0; tx < WORLD_TILE_N; tx++) {
+            int tidx = tz * WORLD_TILE_N + tx;
+            if (!g_dlRoadTile[tidx]) continue;
+            float tcx = WORLD_X0 + (tx + 0.5f) * tileW;
+            if (tileInFrustum(tcx, tcz, g_roadTileRadius[tidx], 16500.0f)) {
+                glCallList(g_dlRoadTile[tidx]);
+            }
+        }
+    }
+    if (g_dlRails) glCallList(g_dlRails);
     glCallList(g_dlLandmarksAndAirports);
 
-    // 1B. Ege Korfezi Canli Dalgali Su Yuzeyi (Zamanla suzulur)
+    // 1B. 8x8 Spatial Tile Ege Korfezi Canli Su Yuzeyi + Gunes/Ay Iltisi (Specular Shimmer)
     glMatrixMode(GL_TEXTURE);
     glPushMatrix();
     glTranslatef(simTime * 0.005f, simTime * 0.003f, 0.0f);
     glMatrixMode(GL_MODELVIEW);
-    glCallList(g_dlSea);
+    for (int tz = 0; tz < WORLD_TILE_N; tz++) {
+        float tcz = WORLD_Z0 + (tz + 0.5f) * tileH;
+        for (int tx = 0; tx < WORLD_TILE_N; tx++) {
+            int tidx = tz * WORLD_TILE_N + tx;
+            if (!g_dlSeaTile[tidx]) continue;
+            float tcx = WORLD_X0 + (tx + 0.5f) * tileW;
+            if (tileInFrustum(tcx, tcz, tileHalfDiag, 29000.0f)) {
+                glCallList(g_dlSeaTile[tidx]);
+            }
+        }
+    }
     glMatrixMode(GL_TEXTURE);
     glPopMatrix();
     glMatrixMode(GL_MODELVIEW);
+    renderWaterShimmer3D(simTime, eye, sunDir);
 
-    // 1C. Ege Gokyuzu, Gunes/Ay ve 3D Kumulus Bulutlari
-    renderSkyAndClimate3D(simTime, eye);
+    // 1C. Ay, 1100+ Yildiz, Gunes ve 5-Puf Hacimli 3D Kumulus Bulutlari
+    renderSkyAndClimate3D(simTime, eye, sunDir);
 
-    // 2. 50.000+ Bina 400x400m CityChunk Display Lists (mesafe + gorus konisi budamali)
-    Vec2 camFwd2D = norm2(Vec2(center.x - eye.x, center.z - eye.z));
-    std::vector<int> visChunks;
-    visChunks.reserve(900);
+    // 2. 50.000+ Bina 400x400m CityChunk Multi-LOD Derleme ve Cizimi
+    const float tanHalfH = (float)aspect * std::tan(31.0f * DEG2RAD);
+    const float frustumSlope = tanHalfH + 0.16f; // Yuvarlanma (bank) payi dahil yatay gorus konisi
+    struct PendingChunk { int idx; float d2; };
+    std::vector<PendingChunk> uncompiledVis;
+    std::vector<int> visGround, visBuildings, visSkyline, visNearDetails, visMidTrees, visNight;
+    visGround.reserve(350);
+    visBuildings.reserve(450);
+    visSkyline.reserve(300);
+    visNearDetails.reserve(160);
+    visMidTrees.reserve(220);
+    if (g_timeOfDay >= 1) visNight.reserve(550);
+
     for (int i = 0; i < CHUNK_NX * CHUNK_NZ; i++) {
         CityChunk& ck = g_cityChunks[i];
-        if (ck.bldgs.empty() && ck.trees.empty()) continue;
+        bool hasV2R = (i < (int)g_chunkV2Roads.size() && !g_chunkV2Roads[i].empty());
+        bool hasGard = (i < (int)g_chunkGardens.size() && !g_chunkGardens[i].empty());
+        bool hasSide = (!g_hasV2Roads && i < (int)g_chunkSideStreets.size() && !g_chunkSideStreets[i].empty());
+        if (ck.bldgs.empty() && ck.trees.empty() && !hasV2R && !hasGard && !hasSide) continue;
+
         float dx = ck.cx - eye.x, dz = ck.cz - eye.z;
         float d2 = dx * dx + dz * dz;
         if (d2 > 14500.0f * 14500.0f) continue;
-        if (d2 > 900.0f * 900.0f) {
-            float d = std::sqrt(d2);
-            float cosA = (dx * camFwd2D.x + dz * camFwd2D.z) / d;
-            if (cosA < -0.35f) continue;
+
+        float along = dx * camFwd2D.x + dz * camFwd2D.z;
+        if (along < -380.0f) continue;
+        if (d2 > 600.0f * 600.0f && along > 180.0f) {
+            float lat = std::fabs(-dx * camFwd2D.z + dz * camFwd2D.x);
+            if (lat > along * frustumSlope + 340.0f) continue;
         }
-        compileChunkIfNeeded(ck);
-        visChunks.push_back(i);
+
+        if (!ck.compiled) {
+            uncompiledVis.push_back({i, d2});
+            continue;
+        }
+
+        if (d2 <= 4200.0f * 4200.0f) visGround.push_back(i);
+        if (d2 <= 6800.0f * 6800.0f) {
+            visBuildings.push_back(i);
+            if (d2 <= 2200.0f * 2200.0f) visNearDetails.push_back(i);
+            else if (d2 <= 4200.0f * 4200.0f) visMidTrees.push_back(i);
+        } else {
+            visSkyline.push_back(i);
+        }
+        if (g_timeOfDay >= 1 && d2 <= 6800.0f * 6800.0f) visNight.push_back(i);
     }
 
-    // 2A. Mahalle Caddeleri, Ara Sokaklar, Yaya Kaldirimlari ve Ada Bahceleri
-    for (int idx : visChunks) {
+    if (!uncompiledVis.empty()) {
+        std::sort(uncompiledVis.begin(), uncompiledVis.end(),
+                  [](const PendingChunk& a, const PendingChunk& b) { return a.d2 < b.d2; });
+        size_t budget = g_headlessTour ? uncompiledVis.size() : std::min<size_t>(32u, uncompiledVis.size());
+        for (size_t k = 0; k < budget; k++) {
+            int idx = uncompiledVis[k].idx;
+            compileChunkIfNeeded(g_cityChunks[idx]);
+            float d2 = uncompiledVis[k].d2;
+            if (d2 <= 4200.0f * 4200.0f) visGround.push_back(idx);
+            if (d2 <= 6800.0f * 6800.0f) {
+                visBuildings.push_back(idx);
+                if (d2 <= 2200.0f * 2200.0f) visNearDetails.push_back(idx);
+                else if (d2 <= 4200.0f * 4200.0f) visMidTrees.push_back(idx);
+            } else {
+                visSkyline.push_back(idx);
+            }
+            if (g_timeOfDay >= 1 && d2 <= 6800.0f * 6800.0f) visNight.push_back(idx);
+        }
+    }
+
+    // 2A. Mahalle Caddeleri, Ara Sokaklar, Yaya Kaldirimlari ve Ada Bahceleri (< 4.2 km)
+    for (int idx : visGround) {
         if (g_cityChunks[idx].dlGround) glCallList(g_cityChunks[idx].dlGround);
     }
 
+    // 2B. Yakin & Orta Mesafe Ana Bina Govdeleri (< 5.2 km, arka yuzey CW culling)
     glEnable(GL_TEXTURE_2D);
+    glEnable(GL_CULL_FACE);
+    glFrontFace(GL_CW);
+    glCullFace(GL_BACK);
     glBindTexture(GL_TEXTURE_2D, g_tex[TEX_APT_FACADE]);
-    for (int idx : visChunks) if (g_cityChunks[idx].dlApt) glCallList(g_cityChunks[idx].dlApt);
+    for (int idx : visBuildings) if (g_cityChunks[idx].dlApt) glCallList(g_cityChunks[idx].dlApt);
 
     glBindTexture(GL_TEXTURE_2D, g_tex[TEX_GLASS_TOWER]);
-    for (int idx : visChunks) if (g_cityChunks[idx].dlGlass) glCallList(g_cityChunks[idx].dlGlass);
+    for (int idx : visBuildings) if (g_cityChunks[idx].dlGlass) glCallList(g_cityChunks[idx].dlGlass);
 
     glBindTexture(GL_TEXTURE_2D, g_tex[TEX_INDUSTRIAL]);
-    for (int idx : visChunks) if (g_cityChunks[idx].dlInd) glCallList(g_cityChunks[idx].dlInd);
+    for (int idx : visBuildings) if (g_cityChunks[idx].dlInd) glCallList(g_cityChunks[idx].dlInd);
 
-    for (int idx : visChunks) if (g_cityChunks[idx].dlRoofAndTrees) glCallList(g_cityChunks[idx].dlRoofAndTrees);
+    // 2C. Uzak Ufuk Skyline Kule/Rezidans LOD'lari (7.6km..14.5km)
+    glBindTexture(GL_TEXTURE_2D, g_tex[TEX_GLASS_TOWER]);
+    for (int idx : visSkyline) if (g_cityChunks[idx].dlSkylineLod) glCallList(g_cityChunks[idx].dlSkylineLod);
+    glDisable(GL_CULL_FACE);
+
+    // 2D. Catilar (beton teras + kiremit kirma) (< 7.6 km)
+    glBindTexture(GL_TEXTURE_2D, g_tex[TEX_CONCRETE]);
+    for (int idx : visBuildings) if (g_cityChunks[idx].dlRoof) glCallList(g_cityChunks[idx].dlRoof);
+
+    glBindTexture(GL_TEXTURE_2D, g_tex[TEX_ROOF_TILE]);
+    for (int idx : visBuildings) if (g_cityChunks[idx].dlTileRoof) glCallList(g_cityChunks[idx].dlTileRoof);
+
+    // 2E. Yakin Mimari Balkon/Teras Detaylari + Katmanli 3D Agaclar (< 3.4 km) ve Orta Mesafe Agac Silueti (3.4..5.8 km)
+    for (int idx : visNearDetails) if (g_cityChunks[idx].dlNearDetails) glCallList(g_cityChunks[idx].dlNearDetails);
+    glDisable(GL_TEXTURE_2D);
+    for (int idx : visMidTrees) if (g_cityChunks[idx].dlMidTrees) glCallList(g_cityChunks[idx].dlMidTrees);
+
+    // 2F. Gece & Alacakaranlik Sehir Isiklari (Parlayan Bina Pencereleri + Gökdelenler + Kordon/Bulvar Lambalari + Ucak Ikaz Fenerleri)
+    if (g_timeOfDay >= 1) {
+        const float zeroFog[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        glFogfv(GL_FOG_COLOR, zeroFog);
+        glDisable(GL_LIGHTING);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE);
+        glDepthMask(GL_FALSE);
+
+        // Bina pencere isiklari (dlNightWindows, CW culling + TEX_NIGHT_WINDOWS)
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, g_tex[TEX_NIGHT_WINDOWS]);
+        glEnable(GL_CULL_FACE);
+        glFrontFace(GL_CW);
+        glCullFace(GL_BACK);
+        for (int idx : visNight) {
+            if (g_cityChunks[idx].dlNightWindows) glCallList(g_cityChunks[idx].dlNightWindows);
+        }
+
+        // Bayrakli & Konak simge cam gokdelenleri gece aydinlatmasi (burgu acisiyla uyumlu)
+        glDisable(GL_CULL_FACE);
+        float towerBright = (g_timeOfDay == 2) ? 0.95f : 0.45f;
+        glBegin(GL_QUADS);
+        for (const auto& tl : g_landmarkGlowTowers) {
+            float dx = tl.cx - eye.x, dz = tl.cz - eye.z;
+            if (dx * dx + dz * dz > 16000.0f * 16000.0f) continue;
+            if (dx * camFwd2D.x + dz * camFwd2D.z < -tl.baseW * 2.0f) continue;
+            glColor3f(tl.r * towerBright, tl.g * towerBright, tl.b * towerBright);
+            const int SLICES = 8;
+            for (int s = 0; s < SLICES; s++) {
+                float t0 = (float)s / (float)SLICES;
+                float t1 = (float)(s + 1) / (float)SLICES;
+                float y0 = tl.baseY + t0 * tl.height;
+                float y1 = tl.baseY + t1 * tl.height;
+                float a0 = t0 * tl.twistDeg * DEG2RAD;
+                float a1 = t1 * tl.twistDeg * DEG2RAD;
+                float hw0 = tl.baseW * 0.5f * (1.0f - 0.14f * t0), hd0 = tl.baseD * 0.5f * (1.0f - 0.14f * t0);
+                float hw1 = tl.baseW * 0.5f * (1.0f - 0.14f * t1), hd1 = tl.baseD * 0.5f * (1.0f - 0.14f * t1);
+                auto cPt = [&](float hw, float hd, float ang, int idx) {
+                    float lx = (idx == 0 || idx == 3) ? -hw : hw;
+                    float lz = (idx == 0 || idx == 1) ? -hd : hd;
+                    float ca = std::cos(ang), sa = std::sin(ang);
+                    return Vec3(tl.cx + lx * ca - lz * sa, 0.0f, tl.cz + lx * sa + lz * ca);
+                };
+                for (int side = 0; side < 4; side++) {
+                    int next = (side + 1) & 3;
+                    Vec3 p00 = cPt(hw0, hd0, a0, side); p00.y = y0;
+                    Vec3 p10 = cPt(hw0, hd0, a0, next); p10.y = y0;
+                    Vec3 p11 = cPt(hw1, hd1, a1, next); p11.y = y1;
+                    Vec3 p01 = cPt(hw1, hd1, a1, side); p01.y = y1;
+                    glTexCoord2f(0.0f, t0 * 8.0f); glVertex3f(p00.x, p00.y, p00.z);
+                    glTexCoord2f(2.0f, t0 * 8.0f); glVertex3f(p10.x, p10.y, p10.z);
+                    glTexCoord2f(2.0f, t1 * 8.0f); glVertex3f(p11.x, p11.y, p11.z);
+                    glTexCoord2f(0.0f, t1 * 8.0f); glVertex3f(p01.x, p01.y, p01.z);
+                }
+            }
+        }
+        glEnd();
+        glDisable(GL_TEXTURE_2D);
+
+        // Kordon / Sahil Bulvari ve Ana Arter Sokak Lambalari (mesafeye gore 2 point size kademesi)
+        float stBright = (g_timeOfDay == 2) ? 0.92f : 0.40f;
+        glPointSize(3.6f);
+        glBegin(GL_POINTS);
+        for (size_t i = 0; i < g_nightStreetLights.size(); i++) {
+            const Vec3& lp = g_nightStreetLights[i];
+            float dx = lp.x - eye.x, dz = lp.z - eye.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 > 2600.0f * 2600.0f) continue;
+            if (d2 > 250.0f * 250.0f && (dx * camFwd2D.x + dz * camFwd2D.z) < -100.0f) continue;
+            glColor3f(1.00f * stBright, 0.78f * stBright, 0.38f * stBright);
+            glVertex3f(lp.x, lp.y, lp.z);
+        }
+        glEnd();
+
+        glPointSize(2.0f);
+        glBegin(GL_POINTS);
+        for (size_t i = 0; i < g_nightStreetLights.size(); i++) {
+            const Vec3& lp = g_nightStreetLights[i];
+            float dx = lp.x - eye.x, dz = lp.z - eye.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 <= 2600.0f * 2600.0f || d2 > 9500.0f * 9500.0f) continue;
+            if ((dx * camFwd2D.x + dz * camFwd2D.z) < 0.0f) continue;
+            glColor3f(0.86f * stBright, 0.60f * stBright, 0.25f * stBright);
+            glVertex3f(lp.x, lp.y, lp.z);
+        }
+        glEnd();
+
+        // Kule & Kopru & Gokdelen yanip sonen kirmizi havacilik ikaz fenerleri (beacon)
+        glPointSize(5.5f);
+        glBegin(GL_POINTS);
+        for (size_t i = 0; i < g_nightBeaconLights.size(); i++) {
+            const Vec3& bp = g_nightBeaconLights[i];
+            float dx = bp.x - eye.x, dz = bp.z - eye.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 > 18000.0f * 18000.0f) continue;
+            float pulse = 0.28f + 0.72f * std::max(0.0f, std::sin(simTime * 3.6f + (float)i * 0.9f));
+            glColor3f(1.0f * pulse, 0.14f * pulse, 0.08f * pulse);
+            glVertex3f(bp.x, bp.y, bp.z);
+        }
+        glEnd();
+
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        glFogfv(GL_FOG_COLOR, fogCol);
+        glEnable(GL_LIGHTING);
+    }
 
     // 3. Canli IZBAN trenleri (8 adet), Korfez vapurlari (6 adet), otoyol trafigi ve 75m elmas beacon'lar
-    renderDynamicTrafficAndBeacons(simTime, g_timeOfDay);
+    renderDynamicTrafficAndBeacons(simTime, g_timeOfDay, eye, camFwd2D);
 
-    // 4. Ucak modeli ve akrobasi/kaza partikulleri
+    // 4. Ucak modeli, gece seyir/strobe fenerleri ve akrobasi/kaza partikulleri
     if (g_camMode != CAM_COCKPIT) {
         renderAircraftModel(g_ac, simTime);
+        if (g_timeOfDay >= 1) {
+            float halfW = AC_SPECS[g_ac.type].wingSpan * 0.49f;
+            Vec3 leftTip  = g_ac.pos - g_ac.right * halfW - g_ac.fwd * 0.5f;
+            Vec3 rightTip = g_ac.pos + g_ac.right * halfW - g_ac.fwd * 0.5f;
+            Vec3 tailTip  = g_ac.pos - g_ac.fwd * 4.5f + g_ac.up * 1.4f;
+            float strobe = std::max(0.0f, std::sin(simTime * 8.5f)) > 0.72f ? 1.0f : 0.15f;
+            glDisable(GL_LIGHTING);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_ONE, GL_ONE);
+            glPointSize(5.5f);
+            glBegin(GL_POINTS);
+            glColor3f(1.0f, 0.15f, 0.12f); glVertex3f(leftTip.x, leftTip.y, leftTip.z);
+            glColor3f(0.15f, 1.0f, 0.35f); glVertex3f(rightTip.x, rightTip.y, rightTip.z);
+            glColor3f(1.0f * strobe, 0.96f * strobe, 0.88f * strobe); glVertex3f(tailTip.x, tailTip.y, tailTip.z);
+            glEnd();
+            glDisable(GL_BLEND);
+            glEnable(GL_LIGHTING);
+        }
     }
-    renderParticles();
+    computeWeaponAiming();
+    renderWeaponsAndFires3D(simTime, baseRight, baseUp, eye);
+    renderExplosions3D(baseRight, baseUp);
+    renderParticles(baseRight, baseUp);
 }
 
 static void savePPM(const char* path, int w, int h) {
@@ -7015,7 +9527,35 @@ static void savePPM(const char* path, int w, int h) {
     std::fclose(f);
 }
 
-static int runHeadlessCityInspectionTour() {
+static std::string resolveOsmWorldBinPath() {
+    if (const char* envPath = std::getenv("IZMIR_WORLD_BIN")) {
+        if (envPath[0] && access(envPath, R_OK) == 0) return envPath;
+    }
+    if (access("izmir_osm_world.bin", R_OK) == 0) return "izmir_osm_world.bin";
+    char exeBuf[1024] = {0};
+    ssize_t n = readlink("/proc/self/exe", exeBuf, sizeof(exeBuf) - 1);
+    if (n > 0) {
+        exeBuf[n] = '\0';
+        std::string exeDir(exeBuf);
+        size_t slash = exeDir.find_last_of('/');
+        if (slash != std::string::npos) {
+            std::string cand = exeDir.substr(0, slash + 1) + "izmir_osm_world.bin";
+            if (access(cand.c_str(), R_OK) == 0) return cand;
+        }
+    }
+    if (access("../izmir_osm_world.bin", R_OK) == 0) return "../izmir_osm_world.bin";
+    return "izmir_osm_world.bin";
+}
+
+static std::string resolveRenderOutDir() {
+    const char* envDir = std::getenv("IZMIR_OUT_DIR");
+    std::string dir = (envDir && envDir[0]) ? std::string(envDir) : std::string("renders");
+    mkdir(dir.c_str(), 0755);
+    return dir;
+}
+
+static int runHeadlessCityInspectionTour(bool nightAndBenchOnly, bool combatPreview = false) {
+    g_headlessTour = true;
     int W = 1280, H = 720;
     auto getPlat = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
     EGLDisplay dpy = getPlat ? getPlat(0x31DD, EGL_DEFAULT_DISPLAY, nullptr) : eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -7048,42 +9588,181 @@ static int runHeadlessCityInspectionTour() {
     buildIzbanAndRoadsDisplayList();
     buildLandmarksAndAirportsDisplayList();
 
-    std::printf("\n====================================================================\n");
-    std::printf(" OTONOM IZMIR SEHIR DENETIM TURU : 23 ILCE VE BOLGE GOZLEMI\n");
-    std::printf("====================================================================\n");
+    const std::string outDir = resolveRenderOutDir();
+    auto saveFramePng = [&](const char* pngName) {
+        const char* ppmPath = "/tmp/izmir_verif_frame.ppm";
+        savePPM(ppmPath, W, H);
+        char pngPath[512];
+        std::snprintf(pngPath, sizeof(pngPath), "%s/%s", outDir.c_str(), pngName);
+        char cmd[1200];
+        std::snprintf(cmd, sizeof(cmd), "ffmpeg -y -loglevel error -i \"%s\" \"%s\" && rm -f \"%s\"", ppmPath, pngPath, ppmPath);
+        int rc = system(cmd);
+        (void)rc;
+    };
 
-    for (int i = 0; i < NUM_TOUR_STOPS; i++) {
-        const auto& ts = TOUR_STOPS[i];
-        Vec2 p = geoPt(ts.lat, ts.lon);
-        float terr = sampleTerrainElev(p.x, p.z);
-        g_ac.type = AC_CESSNA;
-        g_ac.pos = Vec3(p.x, terr + ts.alt, p.z);
-        setOrientationFromYawPitchRoll(ts.hdg, ts.pitch, 0.0f);
-        g_ac.vel = g_ac.fwd * 45.0f;
-        g_ac.airspeedMs = 45.0f;
-        g_ac.aglM = ts.alt;
+    if (!nightAndBenchOnly) {
+        std::printf("\n====================================================================\n");
+        std::printf(" OTONOM IZMIR SEHIR DENETIM TURU : 24 ILCE VE BOLGE GOZLEMI\n");
+        std::printf("====================================================================\n");
+
+        g_timeOfDay = 0;
+        for (int i = 0; i < NUM_TOUR_STOPS; i++) {
+            const auto& ts = TOUR_STOPS[i];
+            Vec2 p = geoPt(ts.lat, ts.lon);
+            float terr = sampleTerrainElev(p.x, p.z);
+            g_ac.type = AC_CESSNA;
+            g_ac.pos = Vec3(p.x, terr + ts.alt, p.z);
+            setOrientationFromYawPitchRoll(ts.hdg, ts.pitch, 0.0f);
+            g_ac.vel = g_ac.fwd * 45.0f;
+            g_ac.airspeedMs = 45.0f;
+            g_ac.aglM = ts.alt;
+            syncCameraToAircraft();
+
+            renderScene3D(W, H, 10.0f + i * 2.5f);
+            renderAvionicsHUD(W, H, 60.0f);
+            glFinish();
+
+            char pngName[64];
+            std::snprintf(pngName, sizeof(pngName), "verif_tour_%02d.png", i + 1);
+            saveFramePng(pngName);
+
+            std::printf(" [DENETIM %02d/%d] %-35s : Pos=(%+.0f, %+.0f, %+.0f) AGL=%.0fm ... TAMAM\n",
+                        i + 1, NUM_TOUR_STOPS, ts.district, g_ac.pos.x, g_ac.pos.y, g_ac.pos.z, g_ac.aglM);
+        }
+    }
+
+    // Gece, Gunbatimi, Jet Model & Korfez Performans Benchmark Cekimleri
+    struct SpecialShot {
+        const char* pngName;
+        const char* label;
+        int timeOfDay;
+        int acType;
+        double lat, lon;
+        float alt, hdg, pitch;
+    };
+    static const SpecialShot SHOTS[] = {
+        {"verif_night_01_konak.png",    "Gece Konak & Ay-Yildiz Korfez (F-16)",      2, AC_JET,    38.4165, 27.1245, 130.0f,  26.0f, -2.5f},
+        {"verif_night_02_bayrakli.png", "Gece Bayrakli Folkart/Mistral & Karsiyaka", 2, AC_CESSNA, 38.4420, 27.1490, 220.0f,  28.0f, -4.5f},
+        {"verif_night_03_alsancak.png", "Gece Alsancak Kordon & Kruvaziyer/Vapur",   2, AC_JET,    38.4310, 27.1330, 145.0f,  22.0f, -5.0f},
+        {"verif_sunset_04_bostanli.png","Gunbatimi Korfez Iltisi & F-16C",           1, AC_JET,    38.4460, 27.1100, 150.0f, 265.0f, -4.0f},
+        {"verif_day_05_jet_kordon.png", "Gunduz F-16C Kordon & Gulf Yakini",         0, AC_JET,    38.4250, 27.1310, 135.0f,  28.0f, -5.5f}
+    };
+
+    std::printf("\n====================================================================\n");
+    std::printf(" GECE / GUNBATIMI / F-16 MODEL & KORFEZ PERFORMANS DENETIMI\n");
+    std::printf("====================================================================\n");
+    for (size_t s = 0; s < sizeof(SHOTS) / sizeof(SHOTS[0]); s++) {
+        const auto& sh = SHOTS[s];
+        g_timeOfDay = sh.timeOfDay;
+        g_ac.type = sh.acType;
+        g_ac.gearDown = false;
+        g_ac.gearAnim = 0.0f;
+        Vec2 p = geoPt(sh.lat, sh.lon);
+        float terr = std::max(0.0f, sampleTerrainElev(p.x, p.z));
+        g_ac.pos = Vec3(p.x, terr + sh.alt, p.z);
+        setOrientationFromYawPitchRoll(sh.hdg, sh.pitch, 0.0f);
+        g_ac.vel = g_ac.fwd * ((sh.acType == AC_JET) ? 140.0f : 55.0f);
+        g_ac.airspeedMs = len(g_ac.vel);
+        g_ac.aglM = sh.alt;
         syncCameraToAircraft();
 
-        // 3D sahneyi ve HUD'i ciz
-        renderScene3D(W, H, 10.0f + i * 2.5f);
-        renderAvionicsHUD(W, H, 60.0f);
+        // Warmup + GPU benchmark
+        renderScene3D(W, H, 22.0f + s * 3.1f);
         glFinish();
 
-        char ppmPath[128], pngPath[128];
-        std::snprintf(ppmPath, sizeof(ppmPath), "/tmp/verif_tour_%02d.ppm", i + 1);
-        std::snprintf(pngPath, sizeof(pngPath), "/home/ahmetbey/.gemini/antigravity/brain/bf14e2aa-44c3-4391-99db-ef8d5ce423d1/verif_tour_%02d.png", i + 1);
-        savePPM(ppmPath, W, H);
-        char cmd[512];
-        std::snprintf(cmd, sizeof(cmd), "ffmpeg -y -loglevel error -i %s %s && rm -f %s", ppmPath, pngPath, ppmPath);
-        system(cmd);
+        double t0 = nowSec();
+        const int BENCH_FRAMES = 10;
+        for (int f = 0; f < BENCH_FRAMES; f++) {
+            renderScene3D(W, H, 22.0f + s * 3.1f + f * 0.016f);
+            glFinish();
+        }
+        double avgMs = ((nowSec() - t0) * 1000.0) / BENCH_FRAMES;
+        renderScene3D(W, H, 22.0f + s * 3.1f);
+        renderAvionicsHUD(W, H, (float)(1000.0 / std::max(0.1, avgMs)));
+        glFinish();
 
-        std::printf(" [DENETIM %02d/%d] %-35s : Pos=(%+.0f, %+.0f, %+.0f) AGL=%.0fm ... TAMAM\n",
-                    i + 1, NUM_TOUR_STOPS, ts.district, g_ac.pos.x, g_ac.pos.y, g_ac.pos.z, g_ac.aglM);
+        saveFramePng(sh.pngName);
+        std::printf(" [CEKIM %zu/5] %-42s | AvgRender=%.2f ms (%.1f FPS) -> %s/%s\n",
+                    s + 1, sh.label, avgMs, 1000.0 / std::max(0.1, avgMs), outDir.c_str(), sh.pngName);
     }
-    std::printf("====================================================================\n");
-    std::printf(" %d Ilce ve Bolge Goruntusu Basariyla Olusturuldu ve Denetlendi!\n", NUM_TOUR_STOPS);
     std::printf("====================================================================\n\n");
 
+    if (combatPreview) {
+        teleportAircraft(3); // Alsancak Kordon / Bina Bolgesi
+        g_timeOfDay = 0;
+        g_ac.type = AC_JET;
+        g_ac.gearDown = false;
+        g_ac.gearAnim = 0.0f;
+        Vec2 als = geoPt(38.4310, 27.1365);
+        float terr = std::max(0.0f, sampleTerrainElev(als.x, als.z));
+        g_ac.pos = Vec3(als.x - 160.0f, terr + 145.0f, als.z + 180.0f);
+        setOrientationFromYawPitchRoll(38.0f, -18.0f, 0.0f);
+        g_ac.vel = g_ac.fwd * 125.0f;
+        g_ac.airspeedMs = 125.0f;
+        syncCameraToAircraft();
+
+        // 1. Mermi serisi + Bomba birakma + 3D/HUD nisangah cekimi
+        for (int b = 0; b < 4; b++) {
+            fireBulletStream();
+            updateWeaponsAndFires(0.04f);
+            updateParticlesAndSmoke(0.04f);
+        }
+        dropBomb();
+        updateWeaponsAndFires(0.25f);
+        updateParticlesAndSmoke(0.25f);
+        precompileNearChunks(g_ac.pos, 3200.0f);
+        renderScene3D(W, H, 10.0f);
+        renderAvionicsHUD(W, H, 60.0f);
+        glFinish();
+        saveFramePng("verif_combat_01_aim_fire.png");
+
+        // 2. Bombanin binaya carpmasi, patlama topu + sok dalgasi + bina seklinde 30sn yangin gorunumu
+        bool bombImpacted = false;
+        int postFrames = 0;
+        for (int f = 0; f < 160; f++) {
+            stepFlightPhysicsSubstep(PHYS_DT);
+            updateWeaponsAndFires(0.03f);
+            updateParticlesAndSmoke(0.03f);
+            if (!bombImpacted && !g_activeFires.empty()) {
+                bombImpacted = true;
+            }
+            if (bombImpacted) {
+                postFrames++;
+                if (postFrames == 18) { // patlamadan ~0.55s sonra hem patlama topu hem bina yangini gorunumu
+                    Vec3 fireC = g_activeFires[0].center;
+                    g_ac.crashed = false;
+                    g_ac.pos = fireC + Vec3(-45.0f, 42.0f, 75.0f);
+                    Vec3 lookDir = norm(fireC - g_ac.pos);
+                    g_ac.fwd = lookDir;
+                    g_ac.right = norm(cross(g_ac.fwd, Vec3(0, 1, 0)));
+                    g_ac.up = norm(cross(g_ac.right, g_ac.fwd));
+                    syncCameraToAircraft();
+                    renderScene3D(W, H, 12.2f);
+                    renderAvionicsHUD(W, H, 60.0f);
+                    glFinish();
+                    saveFramePng("verif_combat_02_bomb_fire.png");
+                }
+                if (postFrames >= 55) break; // ~1.65s sonra saf 30s bina seklindeki yangin gorunumu
+            }
+        }
+        if (!g_activeFires.empty()) {
+            Vec3 fireC = g_activeFires[0].center;
+            g_ac.crashed = false;
+            g_ac.pos = fireC + Vec3(-52.0f, 48.0f, 82.0f);
+            g_ac.fwd = norm(fireC - g_ac.pos);
+            g_ac.right = norm(cross(g_ac.fwd, Vec3(0, 1, 0)));
+            g_ac.up = norm(cross(g_ac.right, g_ac.fwd));
+            syncCameraToAircraft();
+            renderScene3D(W, H, 13.8f);
+            renderAvionicsHUD(W, H, 60.0f);
+            glFinish();
+            saveFramePng("verif_combat_03_bldg_blaze.png");
+        }
+        std::printf(" [COMBAT PREVIEW] ActiveFires=%zu Explosions=%zu Particles=%zu -> %s\n",
+                    g_activeFires.size(), g_explosions.size(), g_particles.size(), outDir.c_str());
+    }
+
+    g_headlessTour = false;
     eglDestroyContext(dpy, ctx);
     eglDestroySurface(dpy, surf);
     eglTerminate(dpy);
@@ -7096,10 +9775,13 @@ static int runHeadlessCityInspectionTour() {
 int main(int argc, char** argv) {
     bool testGenOnly = (argc > 1 && std::strcmp(argv[1], "--test-gen") == 0);
     bool inspectCity = (argc > 1 && (std::strcmp(argv[1], "--inspect-city") == 0 || std::strcmp(argv[1], "--test-tour") == 0));
+    bool inspectNight = (argc > 1 && std::strcmp(argv[1], "--inspect-night") == 0);
+    bool inspectCombat = (argc > 1 && std::strcmp(argv[1], "--inspect-combat") == 0);
 
     double tStart = nowSec();
     initNoise(352026u);
-    loadOsmWorldBin("/home/ahmetbey/.gemini/antigravity/scratch/izmir_flight_sim/izmir_osm_world.bin");
+    std::string worldBinPath = resolveOsmWorldBinPath();
+    loadOsmWorldBin(worldBinPath.c_str());
     buildGeographyAndWorldMask();
     computePierSeaPositions();
     generateCityBuildingsAndTrees();
@@ -7116,14 +9798,14 @@ int main(int argc, char** argv) {
     std::printf(" IZBAN Hatti     : %d istasyon, %.1f km cift hat, %d canli 3-vagonlu tren\n",
                 NUM_STATIONS, g_izbanTotalLen * 0.001f, NUM_IZBAN_TRAINS);
     std::printf(" Otoyol Aglari   : %zu ana arter, %zu canli arac, %d Korfez vapuru\n",
-                g_roads.size(), g_vehicles.size(), NUM_FERRIES);
+                activeTrafficRoutes().size(), g_vehicles.size(), NUM_FERRIES);
     std::printf(" Sehir Binalari  : %d cakismasiz bina (%dx%d CityChunk), %d agac\n",
                 g_totalBuildings, CHUNK_NX, CHUNK_NZ, g_totalTrees);
     std::printf(" Uretim Suresi   : %.2f saniye\n", tElapsed);
     std::printf("====================================================================\n");
 
-    if (inspectCity) {
-        return runHeadlessCityInspectionTour();
+    if (inspectCity || inspectNight || inspectCombat) {
+        return runHeadlessCityInspectionTour(inspectNight || inspectCombat, inspectCombat);
     }
 
     if (testGenOnly) {
@@ -7132,15 +9814,25 @@ int main(int argc, char** argv) {
         // -----------------------------------------------------------------
         int bldgInSea = 0, bldgInCorridor = 0, roadInSea = 0, railInSea = 0, ferryOnLand = 0;
         int countTypes[10] = {0};
-        for (const auto& b : g_allBuildings) {
+        for (size_t i = 0; i < (size_t)g_totalBuildings && i < g_allBuildings.size(); i++) {
+            const auto& b = g_allBuildings[i];
             if (b.type < 10) countTypes[b.type]++;
             const WorldMaskCell& mc = queryWorldMask(b.x, b.z);
             if (mc.signedSeaDist <= 0.0f) bldgInSea++;
             if (mc.corridorDist <= 0.0f) bldgInCorridor++;
         }
-        for (const auto& rs : g_roads) {
-            for (const auto& p : rs.pts) {
-                if (sampleSignedSeaDist(p.x, p.z) < 0.0f) roadInSea++;
+        if (g_hasV2Roads) {
+            for (const auto& rp : g_v2MajorRoads) {
+                if (rp.isBridge) continue;
+                for (const auto& p : rp.pts) {
+                    if (sampleSignedSeaDist(p.x, p.z) < 0.0f) roadInSea++;
+                }
+            }
+        } else {
+            for (const auto& rs : g_roads) {
+                for (const auto& p : rs.pts) {
+                    if (sampleSignedSeaDist(p.x, p.z) < 0.0f) roadInSea++;
+                }
             }
         }
         for (const auto& p : g_izbanSpline) {
@@ -7295,6 +9987,95 @@ int main(int argc, char** argv) {
             }
             updateDynamicTraffic(1.0f);
         }
+
+        // [TEST 7] 100m Dinamik Bina Carpisma Esigi Dogrulamasi (>100m gorsel-only, <=100m carpilabilir)
+        if (!g_allBuildings.empty()) {
+            const BuildingInst* probeB = nullptr;
+            for (size_t i = 0; i < g_allBuildings.size(); i++) {
+                const auto& cand = g_allBuildings[i];
+                if (cand.h < 22.0f || cand.y > 25.0f) continue;
+                bool isLocalPeak = true;
+                int x0 = clampi((int)((cand.x - 140.0f - WORLD_X0) / SH_CELL), 0, SH_NX - 1);
+                int x1 = clampi((int)((cand.x + 140.0f - WORLD_X0) / SH_CELL), 0, SH_NX - 1);
+                int z0 = clampi((int)((cand.z - 140.0f - WORLD_Z0) / SH_CELL), 0, SH_NZ - 1);
+                int z1 = clampi((int)((cand.z + 140.0f - WORLD_Z0) / SH_CELL), 0, SH_NZ - 1);
+                for (int gz = z0; gz <= z1 && isLocalPeak; gz++) {
+                    for (int gx = x0; gx <= x1; gx++) {
+                        for (int nIdx : g_spatialHash[gz * SH_NX + gx]) {
+                            if (g_allBuildings[nIdx].y + g_allBuildings[nIdx].h > cand.y + cand.h + 1.0f) {
+                                isLocalPeak = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (isLocalPeak) { probeB = &cand; break; }
+            }
+            if (probeB) {
+                Vec3 insidePt(probeB->x, probeB->y + probeB->h * 0.5f, probeB->z);
+                Vec3 acFar(probeB->x, probeB->y + probeB->h + 125.0f, probeB->z);
+                g_collidersDirty = true;
+                refreshActiveColliders100m(acFar);
+                size_t farCacheSz = g_activeColliders100m.size();
+                bool staticHit = checkBuildingCollision(insidePt, 1.8f);
+                bool farHit = checkAircraftBuildingCollision100m(insidePt, acFar, 1.8f);
+
+                Vec3 acNear(probeB->x, probeB->y + probeB->h + 75.0f, probeB->z);
+                g_collidersDirty = true;
+                refreshActiveColliders100m(acNear);
+                size_t nearCacheSz = g_activeColliders100m.size();
+                bool nearHit = checkAircraftBuildingCollision100m(insidePt, acNear, 1.8f);
+
+                std::printf(" [TEST 7] 100m Bina Carpismasi : StaticHit=%d | >100m(125m): Cache=%zu, Collide=%d | <=100m(75m): Cache=%zu, Collide=%d\n",
+                            (int)staticHit, farCacheSz, (int)farHit, nearCacheSz, (int)nearHit);
+
+                // [TEST 8] Drone Modu 100m Carpma, Ekran Titremesi, Mermi & Bina-Olcekli 30s Bomba Yangini
+                teleportAircraft(2);
+                g_ac.droneMode = true;
+                g_ac.pos = Vec3(probeB->x, probeB->y + probeB->h * 0.5f, probeB->z + probeB->d * 0.5f + 8.0f);
+                g_ac.fwd = Vec3(0, 0, -1);
+                g_ac.right = Vec3(1, 0, 0);
+                g_ac.up = Vec3(0, 1, 0);
+                g_collidersDirty = true;
+                for (int s = 0; s < 120 && !g_ac.crashed; s++) stepFlightPhysicsSubstep(PHYS_DT);
+                bool droneCrashed = g_ac.crashed;
+                bool shakeActive = (g_camShakeTimer > 0.0f && !g_explosions.empty());
+
+                teleportAircraft(2);
+                g_ac.droneMode = false;
+                // Yuksek binanin ~120m disindan nisangah ve atis/bomba testi
+                g_ac.pos = Vec3(probeB->x, probeB->y + probeB->h + 55.0f, probeB->z + 90.0f);
+                g_ac.fwd = norm(Vec3(0.0f, -0.5f, -1.0f));
+                g_ac.up = Vec3(0, 1, 0);
+                g_ac.right = norm(cross(g_ac.fwd, Vec3(0, 1, 0)));
+                g_ac.up = norm(cross(g_ac.right, g_ac.fwd));
+                g_ac.vel = g_ac.fwd * 65.0f;
+                fireBulletStream();
+                dropBomb();
+                for (int s = 0; s < 240; s++) {
+                    updateWeaponsAndFires(0.05f);
+                    updateParticlesAndSmoke(0.05f);
+                }
+                bool fireStarted = (!g_activeFires.empty());
+                float initFireDur = fireStarted ? g_activeFires[0].maxDuration : 0.0f;
+                size_t fireNodes = fireStarted ? g_activeFires[0].nodes.size() : 0;
+                // Toplam 12s + 17s = 29s aninda hala yanmali, 31s sonra sonmus olmali
+                for (int s = 0; s < 340; s++) {
+                    updateWeaponsAndFires(0.05f);
+                }
+                bool burningAt29s = (!g_activeFires.empty());
+                for (int s = 0; s < 50; s++) {
+                    updateWeaponsAndFires(0.05f);
+                }
+                bool outAt31s = g_activeFires.empty();
+                std::printf(" [TEST 8] Silah/Yangin/Drone   : DroneCrash=%d, Shake&Exp=%d | BombaYangin=%d (Dur=%.0fs, Nodes=%zu) | 29s=%d -> 31sSond=%d\n",
+                            (int)droneCrashed, (int)shakeActive, (int)fireStarted, initFireDur, fireNodes,
+                            (int)burningAt29s, (int)outAt31s);
+                if (!staticHit || farHit || !nearHit || !droneCrashed || !shakeActive || !fireStarted || !burningAt29s || !outAt31s) {
+                    return 1;
+                }
+            }
+        }
         std::printf("====================================================================\n");
         return 0;
     }
@@ -7347,12 +10128,13 @@ int main(int argc, char** argv) {
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_NORMALIZE);
 
-    // 10 adet 512x512 Prosedurel HD Doku (8x Anisotropic Filtering + Mipmap) ve Display List'ler
+    // 12 adet Doku (11x 512x512 Prosedurel HD Doku + 1x 2048x2048 GIS) ve Tile Display List'ler
     buildProceduralTextures();
     buildTerrainAndSeaDisplayList();
     buildQuayAndPromenadeDisplayList();
     buildIzbanAndRoadsDisplayList();
     buildLandmarksAndAirportsDisplayList();
+    precompileNearChunks(g_ac.pos, 1800.0f);
 
     bool keys[65536] = {false};
     bool running = true;
@@ -7411,6 +10193,8 @@ int main(int argc, char** argv) {
                     }
                 }
                 else if (ks == XK_r || ks == XK_R) resetAndRecoverAircraftInAir();
+                else if (ks == XK_j || ks == XK_J || ks == XK_Return) g_gunTriggerEdge = true;
+                else if (ks == XK_m || ks == XK_M || ks == XK_u || ks == XK_U) g_bombTriggerEdge = true;
             } else if (xev.type == KeyRelease) {
                 if (XEventsQueued(dpy, QueuedAfterReading)) {
                     XEvent nev;
@@ -7454,10 +10238,10 @@ int main(int argc, char** argv) {
         if (keys[XK_Right] || keys[XK_d] || keys[XK_D]) rollTarget += 1.0f;
         if (keys[XK_Left]  || keys[XK_a] || keys[XK_A]) rollTarget -= 1.0f;
 
-        // Rudder / Yaw (Yon Dumeni): Q/E, Gamepad Sag Analog X (Axis 3) ve LB/RB (Btn 4/5)
+        // Rudder / Yaw (Yon Dumeni): Q/E ve Gamepad Sag Analog X (Axis 3) (LB/RB silahlara ayrildi)
         float yawTarget = g_jsAxis[3] * 0.85f;
-        if (keys[XK_e] || keys[XK_E] || g_jsBtn[5]) yawTarget += 1.0f;
-        if (keys[XK_q] || keys[XK_Q] || g_jsBtn[4]) yawTarget -= 1.0f;
+        if (keys[XK_e] || keys[XK_E]) yawTarget += 1.0f;
+        if (keys[XK_q] || keys[XK_Q]) yawTarget -= 1.0f;
 
         float brakeTarget = (keys[XK_space] || g_jsBtn[1]) ? 1.0f : g_jsAxis[2];
 
@@ -7509,6 +10293,23 @@ int main(int argc, char** argv) {
             physAccum -= PHYS_DT;
         }
         updateDynamicTraffic(frameDt);
+        bool wantGun = (keys[XK_j] || keys[XK_J] || keys[XK_Return] || g_jsBtn[5] || g_gunTriggerEdge);
+        if (wantGun && g_gunFireCd <= 0.0f && !g_ac.crashed) {
+            fireBulletStream();
+            g_gunFireCd = 0.068f;
+            g_gunTriggerEdge = false;
+        } else {
+            g_gunTriggerEdge = false;
+        }
+        bool wantBomb = (g_bombTriggerEdge || keys[XK_m] || keys[XK_M] || keys[XK_u] || keys[XK_U] || g_jsBtn[4]);
+        if (wantBomb && g_bombDropCd <= 0.0f && !g_ac.crashed) {
+            dropBomb();
+            g_bombDropCd = 0.42f;
+            g_bombTriggerEdge = false;
+        } else {
+            g_bombTriggerEdge = false;
+        }
+        updateWeaponsAndFires(frameDt);
         updateParticlesAndSmoke(frameDt);
 
         // Sahne ve Aviyonik HUD cizimi
